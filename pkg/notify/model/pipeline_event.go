@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+const (
+	EventTypePR  = "pr"
+	EventTypeCD  = "cd"
+	EventTypeJob = "job"
+)
+
 type PipelineEvent struct {
 	EventType string
 	Status    string
