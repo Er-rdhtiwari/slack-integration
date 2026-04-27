@@ -7,17 +7,8 @@ import (
 )
 
 type Config struct {
-	PRWebhook      string
-	CDWebhook      string
-	JobWebhook     string
-	DefaultWebhook string
-}
-
-type RouteResult struct {
-	RouteName    string
-	WebhookURL   string
-	UsedFallback bool
-	Reason       string
+	PRWebhookURL string
+	CDWebhookURL string
 }
 
 type Router struct {
@@ -30,57 +21,27 @@ func NewRouter(config Config) Router {
 	}
 }
 
-func (r Router) Resolve(event model.PipelineEvent) (RouteResult, error) {
+func (r Router) ResolveWebhook(event model.PipelineEvent) (string, error) {
 	switch event.EventType {
+	case "pr":
+		if r.config.PRWebhookURL == "" {
+			return "", fmt.Errorf("resolve pr webhook : %w", ErrMissingWebhook)
+		}
+		return r.config.PRWebhookURL, nil
 
-	case model.EventTypePR:
-		if r.config.PRWebhook == "" {
-			return RouteResult{}, fmt.Errorf("PR webhook is missing")
+	case "cd":
+		if r.config.CDWebhookURL == "" {
+			return "", fmt.Errorf("resolve cd webhook : %w", ErrMissingWebhook)
 		}
-		return RouteResult{
-			RouteName:  "pr",
-			WebhookURL: r.config.PRWebhook,
-			Reason:     "PR event routed to PR webhook",
-		}, nil
-	case model.EventTypeCD:
-		if r.config.CDWebhook == "" {
-			return RouteResult{}, fmt.Errorf("CD webhook is missing")
-		}
+		return r.config.CDWebhookURL, nil
 
-		return RouteResult{
-			RouteName:  "cd",
-			WebhookURL: r.config.CDWebhook,
-			Reason:     "CD event routed to CD webhook",
-		}, nil
-	case model.EventTypeJob:
-		if r.config.JobWebhook != "" {
-			return RouteResult{
-				RouteName:  "job",
-				WebhookURL: r.config.JobWebhook,
-				Reason:     "Job event routed to Job webhook",
-			}, nil
+	case "job":
+		if r.config.CDWebhookURL == "" {
+			return "", fmt.Errorf("resolve job fallback webhook : %w", ErrMissingWebhook)
 		}
-
-		if r.config.CDWebhook != "" {
-			return RouteResult{
-				RouteName:    "cd",
-				WebhookURL:   r.config.CDWebhook,
-				UsedFallback: true,
-				Reason:       "Job webhook missing, fallback to CD webhook",
-			}, nil
-		}
-		return RouteResult{}, fmt.Errorf("job webhook missing and CD fallback webhook also missing")
+		return r.config.CDWebhookURL, nil
 
 	default:
-		if r.config.DefaultWebhook != "" {
-			return RouteResult{
-				RouteName:    "default",
-				WebhookURL:   r.config.DefaultWebhook,
-				UsedFallback: true,
-				Reason:       "Unknown event routed to default webhook",
-			}, nil
-		}
-		return RouteResult{}, fmt.Errorf("unsupported event type: %s", event.EventType)
+		return "", fmt.Errorf("event type %q: %w", event.EventType, ErrMissingWebhook)
 	}
-
 }
