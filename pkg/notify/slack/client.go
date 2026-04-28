@@ -12,15 +12,15 @@ type Client struct {
 	httpClient *http.Client
 }
 
-type Message struct {
-	Text string `json:"text"`
-}
-
-func NewClient() Client {
+func NewClient(httpClient ...*http.Client) Client {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	if len(httpClient) > 0 && httpClient[0] != nil {
+		client = httpClient[0]
+	}
 	return Client{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient: client,
 	}
 }
 
@@ -54,4 +54,8 @@ func (c Client) SendMessage(webhookURL string, message Message) error {
 	}
 
 	return nil
+}
+
+func (c Client) Send(webhookURL string, message Message) error {
+	return c.SendMessage(webhookURL, message)
 }
