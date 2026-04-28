@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slack-notifier-config
+  namespace: slack-integration-dev
+data:
+  APP_ENV: "dev"
+  LOG_LEVEL: "debug"
+  RETRY_COUNT: "3"
