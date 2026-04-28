@@ -12,12 +12,12 @@ func TestPipelineEventValidate(t *testing.T) {
 	}{
 		{
 			name: "valid pr event",
-		    event: PipelineEvent{
+			event: PipelineEvent{
 				EventType:    "pr",
 				Stage:        "validation",
 				Status:       "succeeded",
 				PipelineName: "pr-check",
-				},
+			},
 			wantErr: false,
 		},
 		{
