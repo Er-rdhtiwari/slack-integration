@@ -1,0 +1,22 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: go-build
+  namespace: slack-integration-dev
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: build
+      image: golang:1.22
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        echo "Building Go binary..."
+        mkdir -p bin
+        go build -o bin/slack-notifier ./cmd/slack-notifier
+
+        echo "Build completed"
+        ls -lh bin/

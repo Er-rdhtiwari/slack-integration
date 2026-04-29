@@ -76,6 +76,159 @@ kubectl logs -n slack-integration-dev deploy/slack-notifier
 kubectl rollout status deployment/slack-notifier -n slack-integration-dev
 ```
 
+## Tekton pipeline
+
+The `.tekton/` manifests define a Tekton pipeline for preparing sample Go source, validating event params, running tests, building the binary, and simulating a Slack notification.
+
+### Tekton command reference
+
+Use these commands from the repository root. If you are already inside `.tekton/`, remove the `.tekton/` prefix from manifest paths.
+
+Install Tekton Pipelines CRDs and controllers:
+
+```bash
+kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+```
+
+Purpose: installs the `Task`, `TaskRun`, `Pipeline`, and `PipelineRun` resource types. Without this, Kubernetes returns `no matches for kind "Task" in version "tekton.dev/v1"`.
+
+Check Tekton controller pods:
+
+```bash
+kubectl get pods -n tekton-pipelines
+kubectl get pods -n tekton-pipelines -w
+```
+
+Purpose: confirms the Tekton controllers and webhook are running. Wait until all pods show `1/1 Running` before applying Tekton resources.
+
+Verify Tekton API resources:
+
+```bash
+kubectl api-resources | grep tekton
+```
+
+Purpose: confirms the Tekton CRDs are registered with the cluster. You should see resources such as `tasks`, `taskruns`, `pipelines`, and `pipelineruns`.
+
+Apply the Tekton namespace:
+
+```bash
+kubectl apply -f .tekton/namespace.yaml
+```
+
+Purpose: creates or updates the `slack-integration-dev` namespace used by the Tekton resources.
+
+Apply all Tasks and the Pipeline:
+
+```bash
+kubectl apply -f .tekton/task-prepare-source.yaml
+kubectl apply -f .tekton/task-validate-event.yaml
+kubectl apply -f .tekton/task-go-test.yaml
+kubectl apply -f .tekton/task-go-build.yaml
+kubectl apply -f .tekton/task-slack-notify.yaml
+kubectl apply -f .tekton/pipeline-slack-integration.yaml
+```
+
+Purpose: creates the reusable Tekton Tasks and the Pipeline that connects them.
+
+Create a new PipelineRun:
+
+```bash
+kubectl create -f .tekton/pipelinerun-slack-integration.yaml
+```
+
+Purpose: starts a new pipeline execution. Use `kubectl create` for this file because it uses `metadata.generateName`, so each run gets a unique generated name.
+
+List PipelineRuns:
+
+```bash
+kubectl get pipelinerun -n slack-integration-dev
+```
+
+Purpose: checks whether each pipeline is `Running`, `Succeeded`, or `Failed`.
+
+List TaskRuns:
+
+```bash
+kubectl get taskrun -n slack-integration-dev
+```
+
+Purpose: shows which individual pipeline task is pending, running, succeeded, or failed.
+
+List Tekton pods:
+
+```bash
+kubectl get pods -n slack-integration-dev
+```
+
+Purpose: checks the actual pods created by Tekton for each TaskRun. Useful statuses include `PodInitializing`, `Running`, `Completed`, `Error`, and `ImagePullBackOff`.
+
+Stream PipelineRun logs with the Tekton CLI:
+
+```bash
+tkn pipelinerun logs -f -n slack-integration-dev
+```
+
+Purpose: interactively selects a PipelineRun and streams logs from its Tasks.
+
+Stream logs for a specific PipelineRun with `kubectl`:
+
+```bash
+kubectl logs -n slack-integration-dev -l tekton.dev/pipelineRun=<pipelinerun-name> --all-containers=true
+```
+
+Purpose: prints logs from all pods for one PipelineRun. Replace `<pipelinerun-name>` with the actual run name, for example `slack-integration-run-pk5xm`. Do not include angle brackets in the real command.
+
+Describe a failed PipelineRun:
+
+```bash
+kubectl describe pipelinerun -n slack-integration-dev <pipelinerun-name>
+```
+
+Purpose: shows failure reason, conditions, task status, and events for one PipelineRun.
+
+Describe a failed TaskRun:
+
+```bash
+kubectl describe taskrun -n slack-integration-dev <taskrun-name>
+```
+
+Purpose: shows lower-level failure details for a specific Task, such as `run-tests`.
+
+Describe a stuck or failed pod:
+
+```bash
+kubectl describe pod -n slack-integration-dev <pod-name>
+```
+
+Purpose: shows scheduling, image pull, volume mount, PVC, and container startup events.
+
+Check PVCs created for PipelineRun workspaces:
+
+```bash
+kubectl get pvc -n slack-integration-dev
+kubectl describe pvc -n slack-integration-dev <pvc-name>
+```
+
+Purpose: verifies workspace storage. The PipelineRun uses `volumeClaimTemplate` so files from `prepare-source`, such as `go.mod`, persist for later Tasks like `go-test` and `go-build`.
+
+Delete old PipelineRuns:
+
+```bash
+kubectl delete pipelinerun -n slack-integration-dev <pipelinerun-name>
+```
+
+Purpose: cleans up old runs and their generated TaskRuns/pods.
+
+Delete all PipelineRuns in the namespace:
+
+```bash
+kubectl delete pipelinerun -n slack-integration-dev --all
+```
+
+Purpose: resets the Tekton run history in the namespace before a fresh test.
+
+If applying a Task fails with `no matches for kind "Task" in version "tekton.dev/v1"`, Tekton Pipelines is not installed or the CRDs are not ready yet. Install Tekton first, then wait for the `tekton-pipelines` pods before applying the Task manifests.
+
 ## Debugging steps
 
 ### 1. Validate the manifests

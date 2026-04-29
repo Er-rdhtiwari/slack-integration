@@ -1,0 +1,50 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: validate-event
+  namespace: slack-integration-dev
+spec:
+  params:
+    - name: event-type
+      type: string
+    - name: status
+      type: string
+    - name: pipeline-name
+      type: string
+  steps:
+    - name: validate
+      image: alpine:3.20
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        echo "Validating pipeline event..."
+        echo "Event type: $(params.event-type)"
+        echo "Status: $(params.status)"
+        echo "Pipeline name: $(params.pipeline-name)"
+
+        if [ -z "$(params.event-type)" ]; then
+          echo "event-type is required"
+          exit 1
+        fi
+        if [ -z "$(params.status)" ]; then
+          echo "status is required"
+          exit 1
+        fi
+
+        if [ -z "$(params.pipeline-name)" ]; then
+          echo "pipeline-name is required"
+          exit 1
+        fi
+
+        case "$(params.status)" in
+          running|succeeded|failed)
+            echo "Status is valid"
+            ;;
+          *)
+            echo "Invalid status. Allowed: running, succeeded, failed"
+            exit 1
+            ;;
+        esac
+
+        echo "Validation passed"

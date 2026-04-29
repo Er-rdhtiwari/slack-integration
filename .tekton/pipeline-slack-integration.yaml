@@ -1,0 +1,71 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: slack-integration-pipeline
+  namespace: slack-integration-dev
+spec:
+  params:
+    - name: event-type
+      type: string
+      default: pr
+    - name: status
+      type: string
+      default: succeeded
+    - name: pipeline-name
+      type: string
+      default: pr-validation
+
+  workspaces:
+    - name: shared-source
+
+  tasks:
+    - name: prepare-source
+      taskRef:
+        name: prepare-go-source
+      workspaces:
+        - name: source
+          workspace: shared-source
+
+    - name: validate-event
+      taskRef:
+        name: validate-event
+      runAfter:
+        - prepare-source
+      params:
+        - name: event-type
+          value: $(params.event-type)
+        - name: status
+          value: $(params.status)
+        - name: pipeline-name
+          value: $(params.pipeline-name)
+
+    - name: run-tests
+      taskRef:
+        name: go-test
+      runAfter:
+        - validate-event
+      workspaces:
+        - name: source
+          workspace: shared-source
+
+    - name: build-binary
+      taskRef:
+        name: go-build
+      runAfter:
+        - run-tests
+      workspaces:
+        - name: source
+          workspace: shared-source
+
+    - name: notify-slack
+      taskRef:
+        name: slack-notify
+      runAfter:
+        - build-binary
+      params:
+        - name: event-type
+          value: $(params.event-type)
+        - name: status
+          value: $(params.status)
+        - name: pipeline-name
+          value: $(params.pipeline-name)

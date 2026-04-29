@@ -1,0 +1,25 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: slack-notify
+  namespace: slack-integration-dev
+spec:
+  params:
+    - name: event-type
+      type: string
+    - name: status
+      type: string
+    - name: pipeline-name
+      type: string
+  steps:
+    - name: notify
+      image: alpine:3.20
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+
+        echo "Sending Slack notification..."
+        echo "Pipeline: $(params.pipeline-name)"
+        echo "Event type: $(params.event-type)"
+        echo "Status: $(params.status)"
+        echo "Slack notification simulated successfully"
