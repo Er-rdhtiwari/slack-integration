@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 
+	"github.com/Er-rdhtiwari/slack-integration/pkg/config"
 	applogger "github.com/Er-rdhtiwari/slack-integration/pkg/logger"
 	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/model"
 	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/router"
@@ -18,11 +19,22 @@ func main() {
 	pipelineName := flag.String("pipeline-name", "", "pipeline name")
 	failedStep := flag.String("failed-step", "", "failed step")
 	errorMessage := flag.String("error-message", "", "error message")
-	env := flag.String("env", "dev", "environment")
+	env := flag.String("env", "", "environment")
 
 	flag.Parse()
 
-	log := applogger.New(*env)
+	cfg, err := config.Load()
+	logEnv := "dev"
+	logLevel := ""
+	if cfg != nil {
+		logEnv = cfg.AppEnv
+		logLevel = cfg.LogLevel
+	}
+	if *env != "" {
+		logEnv = *env
+	}
+
+	log := applogger.New(logEnv, logLevel)
 
 	event := model.PipelineEvent{
 		EventType:    *eventType,
@@ -37,6 +49,14 @@ func main() {
 
 	eventLogger.Info().Msg("notification processing started")
 
+	if err != nil {
+		eventLogger.Error().
+			Err(err).
+			Msg("configuration loading failed")
+
+		os.Exit(1)
+	}
+
 	if err := event.Validate(); err != nil {
 		eventLogger.Error().
 			Err(err).
@@ -46,8 +66,8 @@ func main() {
 	}
 
 	rt := router.NewRouter(router.Config{
-		PRWebhookURL: os.Getenv("SLACK_WEBHOOK_URL_PR"),
-		CDWebhookURL: os.Getenv("SLACK_WEBHOOK_URL_CD"),
+		PRWebhookURL: cfg.PRWebhookURL,
+		CDWebhookURL: cfg.CDWebhookURL,
 	})
 
 	webhookURL, err := rt.ResolveWebhook(event)
@@ -80,5 +100,4 @@ func main() {
 	}
 
 	eventLogger.Info().Msg("slack notification sent successfully")
-
 }
