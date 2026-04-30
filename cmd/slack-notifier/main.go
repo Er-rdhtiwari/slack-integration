@@ -10,6 +10,7 @@ import (
 	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/model"
 	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/router"
 	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/slack"
+	pipelinestatus "github.com/Er-rdhtiwari/slack-integration/pkg/status"
 )
 
 func main() {
@@ -43,6 +44,14 @@ func main() {
 		PipelineName: *pipelineName,
 		FailedStep:   *failedStep,
 		ErrorMessage: *errorMessage,
+	}
+
+	tracker := pipelinestatus.NewPipelineTracker(*pipelineName, *eventType, *stage)
+	switch *status {
+	case string(pipelinestatus.StatusSucceeded):
+		tracker.MarkSucceeded()
+	case string(pipelinestatus.StatusFailed):
+		tracker.MarkFailed(*failedStep, *errorMessage)
 	}
 
 	eventLogger := applogger.WithEvent(log, event).Logger()
@@ -88,7 +97,7 @@ func main() {
 	client := slack.NewClient()
 
 	message := slack.Message{
-		Text: "Pipeline event: " + event.EventType + " | Status: " + event.Status,
+		Text: tracker.Summary(),
 	}
 
 	if err := client.SendMessage(webhookURL, message); err != nil {
