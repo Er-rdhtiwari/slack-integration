@@ -1,0 +1,48 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: pr-trigger-template
+  namespace: slack-integration-dev
+spec:
+  params:
+    - name: repo-url
+    - name: repo-full-name
+    - name: pr-number
+    - name: commit-id
+    - name: source-branch
+    - name: target-branch
+    - name: sender
+    - name: action
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: pr-validation-run-
+      spec:
+        pipelineRef:
+          name: pr-validation-pipeline
+
+        params:
+          - name: repo-url
+            value: $(tt.params.repo-url)
+          - name: repo-full-name
+            value: $(tt.params.repo-full-name)
+          - name: pr-number
+            value: $(tt.params.pr-number)
+          - name: commit-id
+            value: $(tt.params.commit-id)
+          - name: source-branch
+            value: $(tt.params.source-branch)
+          - name: target-branch
+            value: $(tt.params.target-branch)
+          - name: action
+            value: $(tt.params.action)
+          - name: sender
+            value: $(tt.params.sender)
+        workspaces:
+          - name: shared-workspace
+            emptyDir: {}
+            
+
+
+

@@ -1,0 +1,72 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: pr-validation-pipeline
+  namespace: slack-integration-dev
+spec:
+  params:
+    - name: repo-url
+      type: string
+    - name: repo-full-name
+      type: string
+    - name: pr-number
+      type: string
+    - name: commit-id
+      type: string
+    - name: source-branch
+      type: string
+    - name: target-branch
+      type: string
+    - name: sender
+      type: string
+    - name: action
+      type: string
+    
+  workspaces:
+    - name: shared-workspace
+  
+  tasks:
+    - name: print-pr-info
+      taskSpec:
+        params:
+          - name: repo-url
+          - name: repo-full-name
+          - name: pr-number
+          - name: commit-id
+          - name: source-branch
+          - name: target-branch
+          - name: sender
+          - name: action
+        steps:
+          - name: print
+            image: alpine:3.19
+            script: |
+              #!/bin/sh
+              echo "PR Event Received"
+              echo "Repo URL: $(params.repo-url)"
+              echo "PR Number: $(params.pr-number)"
+              echo "Commit ID: $(params.commit-id)"
+              echo "Source Branch: $(params.source-branch)"
+              echo "Target Branch: $(params.target-branch)"
+              echo "Sender: $(params.sender)"
+              echo "Action: $(params.action)"
+      params:
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: repo-full-name
+          value: $(params.repo-full-name)
+        - name: pr-number
+          value: $(params.pr-number)
+        - name: commit-id
+          value: $(params.commit-id)
+        - name: source-branch
+          value: $(params.source-branch)
+        - name: target-branch
+          value: $(params.target-branch)
+        - name: action
+          value: $(params.action)
+        - name: sender
+          value: $(params.sender)
+
+
+ 
