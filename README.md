@@ -247,6 +247,8 @@ pr-validation-run-dcqrx-print-pr-info   True        Succeeded
 Inspect task logs:
 
 ```bash
+kubectl get pods -n slack-integration-dev
+
 kubectl logs -n slack-integration-dev <taskrun-pod-name> --all-containers=true
 ```
 
