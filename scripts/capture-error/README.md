@@ -93,7 +93,7 @@ Responsibilities:
 - Verifies common shell dependencies.
 - Reports whether Python mode is available.
 - Reports whether Bash fallback dependencies are available.
-- Emits JSON with `success`, `missing`, `failed_checks`, `python_available`, and `fallback_available`.
+- Emits JSON with `success`, `status`, `missing`, `failed_checks`, `python_available`, `fallback_missing`, `fallback_available`, and `install_hints`.
 
 Example:
 
@@ -113,14 +113,19 @@ Responsibilities:
 - Produces secret-redaction examples.
 - Produces timeout and non-zero-exit scenarios.
 - Produces large-output and no-newline scenarios.
+- Supports focused suites for expected-success, expected-failure, and full non-slow coverage.
 
 Examples:
 
 ```bash
 ./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
 ./scripts/capture-error/capture-error-scenarios.sh --scenario success
+./scripts/capture-error/capture-error-scenarios.sh --all-success
+./scripts/capture-error/capture-error-scenarios.sh --all-failure
 ./scripts/capture-error/capture-error-scenarios.sh --all
 ```
+
+When no scenario is provided, the script prompts for a scenario in a terminal. In non-interactive runs, it lists grouped success/error choices instead of choosing randomly.
 
 ## Requirements
 
@@ -168,6 +173,10 @@ CAPTURE_ERROR_SKIP_DEPS_CHECK=true ./scripts/capture-error/capture-error.sh -- e
 ```text
 --strict-log-errors       Fail when error-like logs are detected. Default.
 --exit-code-only          Fail only when the command exits non-zero.
+--stream-output           Mirror raw command stdout/stderr live to stderr, then print final JSON to stdout. Default.
+--no-stream-output        Capture command output silently, then print only final JSON.
+--stdout true|false       Include captured stdout text in final JSON output. Default: false.
+--stderr true|false       Include captured stderr text in final JSON output. Default: true.
 --timeout SECONDS         Stop the command after this many seconds. Default: 3600.
 --max-output-bytes BYTES  Max bytes returned per stream in JSON. Default: 65536.
 --max-capture-bytes BYTES Max combined stdout/stderr temp bytes before terminating. Default: 10485760.
@@ -188,6 +197,15 @@ CAPTURE_ERROR_REDACTION_REGEX_FILE=/path/to/redaction-patterns.txt
 
 The wrapper prints JSON to stdout and exits with `wrapper_exit_code`.
 
+Command logs are streamed while the process is still running:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario slow
+```
+
+Live command output is mirrored to stderr so stdout can still be parsed as the final JSON result. Streamed output is raw terminal output; redaction still applies to the final JSON. Use `--no-stream-output` to restore the old silent capture behavior.
+
 Important fields:
 
 - `success` - final boolean result.
@@ -196,8 +214,9 @@ Important fields:
 - `wrapper_exit_code` - exit code from `capture-error.sh`.
 - `failure_reason` - failure category, for example `timeout`, `non_zero_exit_code`, `error_log_detected`, or `capture_limit_exceeded`.
 - `summary.stdout_raw_bytes` and `summary.stderr_raw_bytes` - raw captured byte counts.
-- `summary.output_truncated` - whether JSON output was truncated.
-- `output.stdout` and `output.stderr` - captured, redacted output.
+- `summary.output_truncated` - whether captured stdout or stderr exceeded `--max-output-bytes`.
+- `output.stdout` - captured, redacted stdout, present only with `--stdout true`.
+- `output.stderr` - captured, redacted stderr, present by default and removed with `--stderr false`.
 - `fallback_mode` - present as `"bash"` when Python mode is unavailable.
 
 ## Exit Codes
@@ -216,7 +235,7 @@ other Wrapped command exit code.
 
 There are two separate limits:
 
-- `--max-output-bytes` limits how many bytes per stream are returned in JSON.
+- `--max-output-bytes` limits how many bytes per stream can be returned in JSON when that stream is included.
 - `--max-capture-bytes` limits combined raw stdout/stderr captured in temp files. When exceeded, the command is terminated and the wrapper exits `125`.
 
 Examples:
@@ -286,7 +305,7 @@ Timeout failures exit `124`.
 
 ## Scenario Testing
 
-List scenarios:
+List grouped scenarios:
 
 ```bash
 ./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
@@ -299,6 +318,20 @@ Run one scenario:
   ./scripts/capture-error/capture-error-scenarios.sh --scenario success
 ```
 
+Run expected-success coverage:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --all-success
+```
+
+Run expected-failure coverage:
+
+```bash
+./scripts/capture-error/capture-error.sh --exit-code-only -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --all-failure
+```
+
 Run broad coverage:
 
 ```bash
@@ -306,24 +339,43 @@ Run broad coverage:
   ./scripts/capture-error/capture-error-scenarios.sh --all
 ```
 
+Add `--include-slow --sleep SECONDS` to include the slow scenario in `--all` or `--all-success`.
+
 Available scenarios:
 
 ```text
-success
-stderr-info
-warning
-error-log-zero
-json-info
-json-warning
-json-error
-invalid-json
-traceback
-secret
-large-output
-no-newline
-mixed
-nonzero
-slow
+Expected success scenarios:
+  - success
+  - stderr-info
+  - warning
+  - multi-warning
+  - json-info
+  - json-warning
+  - json-array
+  - invalid-json
+  - large-output
+  - interleaved-output
+  - progress
+  - carriage-return
+  - no-newline
+  - empty-output
+  - slow
+
+Expected failure scenarios:
+  - error-log-zero
+  - stderr-error-zero
+  - fatal-text-zero
+  - json-error
+  - json-fatal
+  - json-nested-secret
+  - traceback
+  - multiline-stack
+  - secret
+  - command-not-found-text
+  - mixed
+  - nonzero
+  - nonzero-no-output
+  - signal-term
 ```
 
 ## Kubernetes Notes

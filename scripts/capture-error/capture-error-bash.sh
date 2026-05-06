@@ -7,6 +7,9 @@ set -uo pipefail
 set -m
 
 STRICT_LOG_ERRORS=true
+STREAM_OUTPUT=true
+INCLUDE_STDOUT=false
+INCLUDE_STDERR=true
 TIMEOUT_SECONDS=3600
 MAX_OUTPUT_BYTES="${CAPTURE_ERROR_MAX_OUTPUT_BYTES:-65536}"
 MAX_CAPTURE_BYTES="${CAPTURE_ERROR_MAX_CAPTURE_BYTES:-10485760}"
@@ -51,6 +54,21 @@ json_string() {
   printf '"%s"' "$escaped"
 }
 
+parse_bool_option() {
+  local option_name="$1"
+  local option_value="$2"
+
+  case "$option_value" in
+    true|false)
+      printf '%s' "$option_value"
+      ;;
+    *)
+      echo "Error: $option_name requires true or false." >&2
+      exit 64
+      ;;
+  esac
+}
+
 show_help() {
   cat <<'EOF'
 Usage:
@@ -60,6 +78,10 @@ Usage:
 Wrapper options:
   --strict-log-errors      Mark result as failed if error-like logs are detected. Default.
   --exit-code-only         Mark failed only when command exits non-zero.
+  --stream-output          Mirror raw command stdout/stderr live to stderr, then print final JSON to stdout. Default.
+  --no-stream-output       Capture command output silently, then print only final JSON.
+  --stdout true|false      Include captured stdout text in final JSON output. Default: false.
+  --stderr true|false      Include captured stderr text in final JSON output. Default: true.
   --timeout SECONDS        Stop the command after this many seconds. Default: 3600.
   --max-output-bytes BYTES Maximum bytes returned per stream in JSON. Default: 65536.
   --max-capture-bytes BYTES Maximum combined temp log bytes before terminating. Default: 10485760.
@@ -76,7 +98,8 @@ redact_text() {
   text="$(printf '%s' "$text" | sed -E \
     -e 's#https://hooks\.slack\.com/services/[A-Za-z0-9_/-]+#[REDACTED_SLACK_WEBHOOK]#g' \
     -e 's#([Aa]uthorization[[:space:]]*:[[:space:]]*[Bb]earer[[:space:]]+)[A-Za-z0-9._~+/-]+=*#\1[REDACTED]#g' \
-    -e 's#((slack_)?webhook(_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd)([[:space:]]*[:=][[:space:]]*)[^[:space:],'\''"]+#\1\4[REDACTED]#Ig')"
+    -e 's#(["]authorization["][[:space:]]*:[[:space:]]*["][Bb]earer[[:space:]]+)[^"]+#\1[REDACTED]#Ig' \
+    -e 's#((slack_)?webhook(_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd|authorization)([[:space:]]*[:=][[:space:]]*)[^[:space:],'\''"]+#\1\4[REDACTED]#Ig')"
 
   if [ -n "$REDACTION_REGEX_FILE" ] && [ -r "$REDACTION_REGEX_FILE" ]; then
     while IFS= read -r pattern || [ -n "$pattern" ]; do
@@ -158,6 +181,32 @@ while [[ "$#" -gt 0 ]]; do
       STRICT_LOG_ERRORS=false
       shift
       ;;
+    --stream-output)
+      STREAM_OUTPUT=true
+      shift
+      ;;
+    --no-stream-output)
+      STREAM_OUTPUT=false
+      shift
+      ;;
+    --stdout)
+      if [ "$#" -lt 2 ]; then
+        echo "Error: --stdout requires true or false." >&2
+        exit 64
+      fi
+      parse_bool_option --stdout "$2" >/dev/null
+      INCLUDE_STDOUT="$2"
+      shift 2
+      ;;
+    --stderr)
+      if [ "$#" -lt 2 ]; then
+        echo "Error: --stderr requires true or false." >&2
+        exit 64
+      fi
+      parse_bool_option --stderr "$2" >/dev/null
+      INCLUDE_STDERR="$2"
+      shift 2
+      ;;
     --timeout)
       if [ "$#" -lt 2 ] || ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
         echo "Error: --timeout requires a positive integer number of seconds." >&2
@@ -226,6 +275,8 @@ fi
 
 stdout_file="$tmpdir/stdout.log"
 stderr_file="$tmpdir/stderr.log"
+stdout_pipe="$tmpdir/stdout.pipe"
+stderr_pipe="$tmpdir/stderr.pipe"
 timeout_file="$tmpdir/timed-out"
 capture_limit_file="$tmpdir/capture-limit-exceeded"
 
@@ -234,12 +285,34 @@ trap 'rm -rf "$tmpdir"' EXIT
 : > "$stdout_file"
 : > "$stderr_file"
 
+foreground_job_number_for_pid() {
+  local pid="$1"
+
+  jobs -l | awk -v pid="$pid" '$2 == pid {gsub(/[^0-9]/, "", $1); print $1; exit}'
+}
+
 start_time="$(date +"%Y-%m-%dT%H:%M:%S%z")"
 start_seconds="$(date +%s)"
 
-(
-  "${command[@]}" > "$stdout_file" 2> "$stderr_file"
-) &
+if [ "$STREAM_OUTPUT" = true ]; then
+  if ! mkfifo "$stdout_pipe" "$stderr_pipe"; then
+    printf '{"success": false, "status": "failed", "exit_code": 70, "wrapper_exit_code": 70, "failure_reason": "stream_pipe_creation_failed", "fallback_mode": "bash"}\n'
+    exit 70
+  fi
+
+  tee -a "$stdout_file" < "$stdout_pipe" >&2 &
+  stdout_tee_pid=$!
+  tee -a "$stderr_file" < "$stderr_pipe" >&2 &
+  stderr_tee_pid=$!
+
+  (
+    "${command[@]}" > "$stdout_pipe" 2> "$stderr_pipe"
+  ) &
+else
+  (
+    "${command[@]}" > "$stdout_file" 2> "$stderr_file"
+  ) &
+fi
 target_pid=$!
 
 (
@@ -273,8 +346,30 @@ timeout_watcher_pid=$!
 ) &
 capture_watcher_pid=$!
 
-wait "$target_pid"
-target_exit_code=$?
+if [ -t 0 ]; then
+  target_job_number="$(foreground_job_number_for_pid "$target_pid")"
+
+  if [ -n "$target_job_number" ]; then
+    fg "%$target_job_number" >/dev/null
+    target_exit_code=$?
+
+    if [ "$target_exit_code" -ne 0 ]; then
+      wait "$target_pid" 2>/dev/null
+      target_exit_code=$?
+    fi
+  else
+    wait "$target_pid"
+    target_exit_code=$?
+  fi
+else
+  wait "$target_pid"
+  target_exit_code=$?
+fi
+
+if [ "$STREAM_OUTPUT" = true ]; then
+  wait "$stdout_tee_pid" 2>/dev/null || true
+  wait "$stderr_tee_pid" 2>/dev/null || true
+fi
 
 kill "$timeout_watcher_pid" >/dev/null 2>&1 || true
 wait "$timeout_watcher_pid" 2>/dev/null || true
@@ -421,12 +516,23 @@ printf '    "stderr_truncated": %s,\n' "$stderr_truncated"
 printf '    "output_truncated": %s\n' "$output_truncated"
 printf '  },\n'
 printf '  "output": {\n'
-printf '    "stdout": '
-json_string "$stdout_text"
-printf ',\n'
-printf '    "stderr": '
-json_string "$stderr_text"
-printf '\n'
+output_field_written=false
+if [ "$INCLUDE_STDOUT" = true ]; then
+  printf '    "stdout": '
+  json_string "$stdout_text"
+  output_field_written=true
+fi
+if [ "$INCLUDE_STDERR" = true ]; then
+  if [ "$output_field_written" = true ]; then
+    printf ',\n'
+  fi
+  printf '    "stderr": '
+  json_string "$stderr_text"
+  output_field_written=true
+fi
+if [ "$output_field_written" = true ]; then
+  printf '\n'
+fi
 printf '  }\n'
 printf '}\n'
 

@@ -8,6 +8,9 @@ set -uo pipefail
 set -m
 
 STRICT_LOG_ERRORS=true
+STREAM_OUTPUT=true
+INCLUDE_STDOUT=false
+INCLUDE_STDERR=true
 TIMEOUT_SECONDS=3600
 MAX_OUTPUT_BYTES="${CAPTURE_ERROR_MAX_OUTPUT_BYTES:-65536}"
 MAX_CAPTURE_BYTES="${CAPTURE_ERROR_MAX_CAPTURE_BYTES:-10485760}"
@@ -77,6 +80,21 @@ json_escape_string() {
   printf '"%s"' "$escaped"
 }
 
+parse_bool_option() {
+  local option_name="$1"
+  local option_value="$2"
+
+  case "$option_value" in
+    true|false)
+      printf '%s' "$option_value"
+      ;;
+    *)
+      echo "Error: $option_name requires true or false." >&2
+      exit 64
+      ;;
+  esac
+}
+
 emit_wrapper_error() {
   local exit_code="$1"
   local failure_reason="$2"
@@ -126,12 +144,16 @@ Usage:
 Wrapper options:
   --strict-log-errors      Mark result as failed if error-like logs are detected. Default.
   --exit-code-only         Mark failed only when command exits non-zero.
-	  --timeout SECONDS        Stop the command after this many seconds. Default: 3600.
+  --stream-output          Mirror raw command stdout/stderr live to stderr, then print final JSON to stdout. Default.
+  --no-stream-output       Capture command output silently, then print only final JSON.
+  --stdout true|false      Include captured stdout text in final JSON output. Default: false.
+  --stderr true|false      Include captured stderr text in final JSON output. Default: true.
+  --timeout SECONDS        Stop the command after this many seconds. Default: 3600.
   --max-output-bytes BYTES  Maximum bytes returned per stream in JSON. Default: 65536.
   --max-capture-bytes BYTES Maximum combined temp log bytes before terminating. Default: 10485760.
   --redaction-regex-file PATH
                             File with extra Python regex patterns to redact, one per line.
-	  -h, --help               Show help.
+  -h, --help               Show help.
 
 Examples:
   ./scripts/capture-error/capture-error.sh ls -la scripts
@@ -152,15 +174,43 @@ while [[ "$#" -gt 0 ]]; do
       STRICT_LOG_ERRORS=false
       shift
       ;;
-	    --timeout)
-	      if [ "$#" -lt 2 ] || ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
-	        echo "Error: --timeout requires a positive integer number of seconds." >&2
-	        exit 64
+    --stream-output)
+      STREAM_OUTPUT=true
+      shift
+      ;;
+    --no-stream-output)
+      STREAM_OUTPUT=false
+      shift
+      ;;
+    --stdout)
+      if [ "$#" -lt 2 ]; then
+        echo "Error: --stdout requires true or false." >&2
+        exit 64
       fi
 
-	      TIMEOUT_SECONDS="$2"
-	      shift 2
-	      ;;
+      parse_bool_option --stdout "$2" >/dev/null
+      INCLUDE_STDOUT="$2"
+      shift 2
+      ;;
+    --stderr)
+      if [ "$#" -lt 2 ]; then
+        echo "Error: --stderr requires true or false." >&2
+        exit 64
+      fi
+
+      parse_bool_option --stderr "$2" >/dev/null
+      INCLUDE_STDERR="$2"
+      shift 2
+      ;;
+    --timeout)
+      if [ "$#" -lt 2 ] || ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --timeout requires a positive integer number of seconds." >&2
+        exit 64
+      fi
+
+      TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
     --max-output-bytes)
       if [ "$#" -lt 2 ] || ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
         echo "Error: --max-output-bytes requires a positive integer number of bytes." >&2
@@ -214,10 +264,14 @@ fi
 run_dependency_check
 
 if [ "$#" -eq 0 ]; then
-  python3 - <<'PY'
+  python3 - "$INCLUDE_STDOUT" "$INCLUDE_STDERR" <<'PY'
 import json
+import sys
 
-print(json.dumps({
+include_stdout = sys.argv[1].lower() == "true"
+include_stderr = sys.argv[2].lower() == "true"
+
+result = {
     "success": False,
     "status": "failed",
     "exit_code": 64,
@@ -237,11 +291,15 @@ print(json.dumps({
         "warning_lines": 0
     },
     "logs": [],
-    "output": {
-        "stdout": "",
-        "stderr": ""
-    }
-}, indent=2))
+    "output": {}
+}
+
+if include_stdout:
+    result["output"]["stdout"] = ""
+if include_stderr:
+    result["output"]["stderr"] = ""
+
+print(json.dumps(result, indent=2))
 PY
   exit 64
 fi
@@ -255,6 +313,8 @@ fi
 
 stdout_file="$tmpdir/stdout.log"
 stderr_file="$tmpdir/stderr.log"
+stdout_pipe="$tmpdir/stdout.pipe"
+stderr_pipe="$tmpdir/stderr.pipe"
 timeout_file="$tmpdir/timed-out"
 capture_limit_file="$tmpdir/capture-limit-exceeded"
 
@@ -265,13 +325,35 @@ if ! : > "$stdout_file" || ! : > "$stderr_file"; then
   exit 70
 fi
 
+foreground_job_number_for_pid() {
+  local pid="$1"
+
+  jobs -l | awk -v pid="$pid" '$2 == pid {gsub(/[^0-9]/, "", $1); print $1; exit}'
+}
+
 start_time="$(date +"%Y-%m-%dT%H:%M:%S%z")"
 start_ms="$(python3 -c 'import time; print(int(time.time() * 1000))')"
 timed_out=false
 
-(
-  "${command[@]}" > "$stdout_file" 2> "$stderr_file"
-) &
+if [ "$STREAM_OUTPUT" = true ]; then
+  if ! mkfifo "$stdout_pipe" "$stderr_pipe"; then
+    emit_wrapper_error 70 "stream_pipe_creation_failed" "Could not create stream output pipes in $tmpdir."
+    exit 70
+  fi
+
+  tee -a "$stdout_file" < "$stdout_pipe" >&2 &
+  stdout_tee_pid=$!
+  tee -a "$stderr_file" < "$stderr_pipe" >&2 &
+  stderr_tee_pid=$!
+
+  (
+    "${command[@]}" > "$stdout_pipe" 2> "$stderr_pipe"
+  ) &
+else
+  (
+    "${command[@]}" > "$stdout_file" 2> "$stderr_file"
+  ) &
+fi
 target_pid=$!
 
 (
@@ -308,8 +390,30 @@ timeout_watcher_pid=$!
 ) &
 capture_watcher_pid=$!
 
-wait "$target_pid"
-target_exit_code=$?
+if [ -t 0 ]; then
+  target_job_number="$(foreground_job_number_for_pid "$target_pid")"
+
+  if [ -n "$target_job_number" ]; then
+    fg "%$target_job_number" >/dev/null
+    target_exit_code=$?
+
+    if [ "$target_exit_code" -ne 0 ]; then
+      wait "$target_pid" 2>/dev/null
+      target_exit_code=$?
+    fi
+  else
+    wait "$target_pid"
+    target_exit_code=$?
+  fi
+else
+  wait "$target_pid"
+  target_exit_code=$?
+fi
+
+if [ "$STREAM_OUTPUT" = true ]; then
+  wait "$stdout_tee_pid" 2>/dev/null || true
+  wait "$stderr_tee_pid" 2>/dev/null || true
+fi
 
 if [ -f "$timeout_file" ]; then
   timed_out=true
@@ -340,6 +444,8 @@ python3 - \
   "$MAX_OUTPUT_BYTES" \
   "$MAX_CAPTURE_BYTES" \
   "$REDACTION_REGEX_FILE" \
+  "$INCLUDE_STDOUT" \
+  "$INCLUDE_STDERR" \
 	  "$start_time" \
 	  "$end_time" \
   "$duration_ms" \
@@ -361,14 +467,16 @@ timeout_seconds = int(sys.argv[5])
 max_output_bytes = int(sys.argv[6])
 max_capture_bytes = int(sys.argv[7])
 redaction_regex_file = sys.argv[8]
-start_time = sys.argv[9]
-end_time = sys.argv[10]
-duration_ms = int(sys.argv[11])
+include_stdout = sys.argv[9].lower() == "true"
+include_stderr = sys.argv[10].lower() == "true"
+start_time = sys.argv[11]
+end_time = sys.argv[12]
+duration_ms = int(sys.argv[13])
 
-stdout_path = Path(sys.argv[12])
-stderr_path = Path(sys.argv[13])
+stdout_path = Path(sys.argv[14])
+stderr_path = Path(sys.argv[15])
 
-command = sys.argv[14:]
+command = sys.argv[16:]
 
 def read_limited_text(path, max_bytes):
     if not path.exists():
@@ -427,20 +535,28 @@ SECRET_REPLACEMENTS = [
         r"\1[REDACTED]",
     ),
     (
+        re.compile(r"(?i)(['\"]authorization['\"]\s*:\s*['\"]bearer\s+)[^'\"]+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(\\['\"]authorization\\['\"]\s*:\s*\\['\"]bearer\s+)[^\\'\"]+"),
+        r"\1[REDACTED]",
+    ),
+    (
         re.compile(
-            r"(?i)\b((?:slack_)?webhook(?:_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd)\b(\s*[:=]\s*)(['\"]?)[^\s,'\"]+"
+            r"(?i)\b((?:slack_)?webhook(?:_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd|authorization)\b(\s*[:=]\s*)(['\"]?)[^\s,'\"]+"
         ),
         r"\1\2\3[REDACTED]",
     ),
     (
         re.compile(
-            r"(?i)(['\"](?:slack_)?(?:webhook(?:_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd)['\"]\s*:\s*['\"])[^'\"]+"
+            r"(?i)(['\"](?:slack_)?(?:webhook(?:_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd|authorization)['\"]\s*:\s*['\"])[^'\"]+"
         ),
         r"\1[REDACTED]",
     ),
     (
         re.compile(
-            r"(?i)(\\['\"](?:slack_)?(?:webhook(?:_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd)\\['\"]\s*:\s*\\['\"])[^\\'\"]+"
+            r"(?i)(\\['\"](?:slack_)?(?:webhook(?:_url)?|token|access_token|refresh_token|api_key|apikey|secret|password|passwd|pwd|authorization)\\['\"]\s*:\s*\\['\"])[^\\'\"]+"
         ),
         r"\1[REDACTED]",
     ),
@@ -678,14 +794,16 @@ result = {
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "output_truncated": stdout_truncated or stderr_truncated
-	    },
+    },
     # Keep disabled to avoid sending very large log payloads; uncomment when full per-line logs are needed.
     # "logs": logs,
-    "output": {
-        "stdout": redact_text(stdout_text),
-        "stderr": redact_text(stderr_text)
-    }
+    "output": {}
 }
+
+if include_stdout:
+    result["output"]["stdout"] = redact_text(stdout_text)
+if include_stderr:
+    result["output"]["stderr"] = redact_text(stderr_text)
 
 print(json.dumps(result, indent=2))
 
