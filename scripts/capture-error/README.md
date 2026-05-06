@@ -30,11 +30,16 @@ CAPTURE_ERROR_REDACTION_REGEX_FILE=/path/to/redaction-patterns.txt
 
 ```text
 scripts/capture-error/
-  capture-error.sh             Main wrapper. Uses Python mode when available.
-  capture-error-bash.sh        No-Python fallback, used automatically.
-  check-deps.sh                Dependency check.
-  capture-error-scenarios.sh   Scenario generator for local testing.
+  capture-error.sh             Main shell entrypoint. Delegates to the Go runtime.
+  runner.sh                    Runtime launcher for binary or local Go source.
+  scenarios.sh                 Scenario generator for local testing.
   README.md
+
+cmd/capture-error/
+  main.go                      Thin Go CLI entrypoint.
+
+pkg/captureerror/
+  captureerror.go              Go capture-error implementation.
 ```
 
 ## Script Details
@@ -45,14 +50,8 @@ Main entrypoint for normal use.
 
 Responsibilities:
 
-- Parses wrapper flags.
-- Runs `check-deps.sh` unless `CAPTURE_ERROR_SKIP_DEPS_CHECK=true`.
-- Uses Python mode when `python3` and required standard-library modules are available.
-- Automatically delegates to `capture-error-bash.sh` when Python mode is unavailable.
-- Captures stdout/stderr into temporary files.
-- Enforces timeout and capture-size limits.
-- Redacts command arguments and captured output.
-- Emits the final JSON result.
+- Delegates to `runner.sh`.
+- Emits a JSON wrapper error if the runner script is missing.
 
 Use this script from CI, Kubernetes jobs, and support automation:
 
@@ -60,48 +59,24 @@ Use this script from CI, Kubernetes jobs, and support automation:
 ./scripts/capture-error/capture-error.sh -- ./my-command --flag value
 ```
 
-### `capture-error-bash.sh`
+### `runner.sh`
 
-Fallback implementation for images without Python.
-
-Responsibilities:
-
-- Supports the same core wrapper flags as `capture-error.sh`.
-- Captures bounded stdout/stderr.
-- Performs text-pattern error and warning detection.
-- Applies built-in and custom redaction patterns.
-- Emits JSON with `"fallback_mode": "bash"`.
-
-Limitations:
-
-- Does not parse structured JSON logs as deeply as Python mode.
-- Uses `sed -E` for custom redaction patterns, so regex syntax should stay portable.
-- Produces a smaller JSON shape than Python mode.
-
-Call it directly only when testing fallback behavior:
-
-```bash
-./scripts/capture-error/capture-error-bash.sh -- ./my-command
-```
-
-### `check-deps.sh`
-
-Dependency checker for the wrapper package.
+Shell wrapper for the Go implementation in `pkg/captureerror`.
 
 Responsibilities:
 
-- Verifies common shell dependencies.
-- Reports whether Python mode is available.
-- Reports whether Bash fallback dependencies are available.
-- Emits JSON with `success`, `status`, `missing`, `failed_checks`, `python_available`, `fallback_missing`, `fallback_available`, and `install_hints`.
+- Uses `CAPTURE_ERROR_BIN` when it points at an executable prebuilt binary.
+- Otherwise builds a temporary binary from `./cmd/capture-error` and runs it.
+- Emits a JSON wrapper error when neither a prebuilt binary nor Go is available.
+- Keeps Go source out of `scripts/capture-error/`.
 
-Example:
+Call it directly only when testing runtime selection behavior:
 
 ```bash
-./scripts/capture-error/check-deps.sh
+./scripts/capture-error/runner.sh -- ./my-command
 ```
 
-### `capture-error-scenarios.sh`
+### `scenarios.sh`
 
 Scenario generator for local validation and future automated tests.
 
@@ -118,18 +93,17 @@ Responsibilities:
 Examples:
 
 ```bash
-./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
-./scripts/capture-error/capture-error-scenarios.sh --scenario success
-./scripts/capture-error/capture-error-scenarios.sh --all-success
-./scripts/capture-error/capture-error-scenarios.sh --all-failure
-./scripts/capture-error/capture-error-scenarios.sh --all
+./scripts/capture-error/scenarios.sh --list-scenarios
+./scripts/capture-error/scenarios.sh --scenario success
+./scripts/capture-error/scenarios.sh --all-success
+./scripts/capture-error/scenarios.sh --all-failure
+./scripts/capture-error/scenarios.sh --all
 ```
 
 When no scenario is provided, the script prompts for a scenario in a terminal. In non-interactive runs, it lists grouped success/error choices instead of choosing randomly.
+For CI and repeatable local checks, prefer explicit flags such as `--scenario success`, `--all-success`, or `--all` instead of the interactive selector.
 
-## Requirements
-
-Common requirements:
+Requirements:
 
 - `bash`
 - `date`
@@ -140,14 +114,15 @@ Common requirements:
 - `wc`
 - writable temp directory, normally `/tmp`
 
-Python mode additionally requires `python3`. It uses only Python standard library modules.
+The wrapper uses the Go implementation. In production or CI images, prefer a prebuilt executable at `bin/capture-error` or set `CAPTURE_ERROR_BIN` to the executable path. For local development, `runner.sh` can build and run `./cmd/capture-error` from a temporary directory when `go` is available.
 
-Bash fallback mode additionally uses common shell utilities: `awk`, `dd`, `grep`, `sed`, and `tr`.
-
-Check dependencies:
+Build a production binary with release metadata:
 
 ```bash
-./scripts/capture-error/check-deps.sh
+go build \
+  -ldflags "-X main.version=0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -o bin/capture-error \
+  ./cmd/capture-error
 ```
 
 ## Quick Start
@@ -160,12 +135,6 @@ Use `--` when the wrapped command has flags:
 
 ```bash
 ./scripts/capture-error/capture-error.sh -- ./my-command --flag value
-```
-
-Skip the automatic dependency check:
-
-```bash
-CAPTURE_ERROR_SKIP_DEPS_CHECK=true ./scripts/capture-error/capture-error.sh -- echo "hello"
 ```
 
 ## Wrapper Flags
@@ -182,6 +151,7 @@ CAPTURE_ERROR_SKIP_DEPS_CHECK=true ./scripts/capture-error/capture-error.sh -- e
 --max-capture-bytes BYTES Max combined stdout/stderr temp bytes before terminating. Default: 10485760.
 --redaction-regex-file PATH
                            Extra redaction regex patterns, one per line.
+--version                  Print capture-error build metadata as JSON.
 -h, --help                Show help.
 ```
 
@@ -201,7 +171,7 @@ Command logs are streamed while the process is still running:
 
 ```bash
 ./scripts/capture-error/capture-error.sh -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --scenario slow
+  ./scripts/capture-error/scenarios.sh --scenario slow
 ```
 
 Live command output is mirrored to stderr so stdout can still be parsed as the final JSON result. Streamed output is raw terminal output; redaction still applies to the final JSON. Use `--no-stream-output` to restore the old silent capture behavior.
@@ -217,7 +187,7 @@ Important fields:
 - `summary.output_truncated` - whether captured stdout or stderr exceeded `--max-output-bytes`.
 - `output.stdout` - captured, redacted stdout, present only with `--stdout true`.
 - `output.stderr` - captured, redacted stderr, present by default and removed with `--stderr false`.
-- `fallback_mode` - present as `"bash"` when Python mode is unavailable.
+- `version` - Go build metadata with `version`, `commit`, and `date`.
 
 ## Exit Codes
 
@@ -242,7 +212,7 @@ Examples:
 
 ```bash
 ./scripts/capture-error/capture-error.sh --max-output-bytes 32768 -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --scenario large-output
+  ./scripts/capture-error/scenarios.sh --scenario large-output
 ```
 
 ```bash
@@ -284,21 +254,21 @@ Default behavior fails the wrapper if the command exits `0` but emits error-like
 
 ```bash
 ./scripts/capture-error/capture-error.sh -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --scenario error-log-zero
+  ./scripts/capture-error/scenarios.sh --scenario error-log-zero
 ```
 
 Use exit-code-only mode to ignore error-like logs:
 
 ```bash
 ./scripts/capture-error/capture-error.sh --exit-code-only -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --scenario error-log-zero
+  ./scripts/capture-error/scenarios.sh --scenario error-log-zero
 ```
 
 ## Timeout
 
 ```bash
 ./scripts/capture-error/capture-error.sh --timeout 1 -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --scenario slow --sleep 10
+  ./scripts/capture-error/scenarios.sh --scenario slow --sleep 10
 ```
 
 Timeout failures exit `124`.
@@ -308,35 +278,35 @@ Timeout failures exit `124`.
 List grouped scenarios:
 
 ```bash
-./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
+./scripts/capture-error/scenarios.sh --list-scenarios
 ```
 
 Run one scenario:
 
 ```bash
 ./scripts/capture-error/capture-error.sh -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --scenario success
+  ./scripts/capture-error/scenarios.sh --scenario success
 ```
 
 Run expected-success coverage:
 
 ```bash
 ./scripts/capture-error/capture-error.sh -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --all-success
+  ./scripts/capture-error/scenarios.sh --all-success
 ```
 
 Run expected-failure coverage:
 
 ```bash
 ./scripts/capture-error/capture-error.sh --exit-code-only -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --all-failure
+  ./scripts/capture-error/scenarios.sh --all-failure
 ```
 
 Run broad coverage:
 
 ```bash
 ./scripts/capture-error/capture-error.sh --exit-code-only -- \
-  ./scripts/capture-error/capture-error-scenarios.sh --all
+  ./scripts/capture-error/scenarios.sh --all
 ```
 
 Add `--include-slow --sleep SECONDS` to include the slow scenario in `--all` or `--all-success`.
@@ -380,7 +350,7 @@ Expected failure scenarios:
 
 ## Kubernetes Notes
 
-`capture-error.sh` works in Kubernetes when the image includes the common requirements. If `python3` is missing, it automatically switches to `capture-error-bash.sh`.
+`capture-error.sh` works in Kubernetes when the image includes the shell requirements and either a prebuilt `capture-error` binary or Go itself.
 
 Images that usually need extra care:
 
@@ -394,32 +364,31 @@ Container checks:
 command -v bash
 command -v mktemp
 test -w /tmp
-command -v python3  # optional, enables Python mode
+test -x ./bin/capture-error || command -v go
 ```
 
-For production support usage, prefer a dedicated utility/debug image instead of adding Bash/Python to a minimal application image.
+For production support usage, prefer a dedicated utility/debug image instead of adding Bash or Go to a minimal application image.
 
 ## Future Development
 
 Recommended follow-up tasks are listed below. These are future hardening items, not current blockers for controlled CI/Kubernetes/support usage.
 
-### 1. Automated Test Suite
+### 1. Automated Test Coverage
 
-Task: add `test-capture-error.sh` for repeatable local and CI validation.
+Task: keep Go unit tests and scenario coverage running in CI.
 
 Subtasks:
 
 - Assert success-path JSON fields.
 - Assert non-zero command exit handling.
 - Assert strict text-log error detection.
-- Assert strict JSON-log error detection in Python mode.
+- Assert strict JSON-log error detection in Go mode.
 - Assert `--exit-code-only` behavior.
 - Assert timeout behavior and exit code `124`.
 - Assert capture-limit behavior and exit code `125`.
 - Assert `--max-output-bytes` truncation metadata.
 - Assert default redaction for Slack webhooks, bearer tokens, API keys, and passwords.
 - Assert custom redaction with `--redaction-regex-file`.
-- Assert automatic Bash fallback when `python3` is unavailable.
 
 ### 2. Kubernetes Runtime Validation
 
@@ -427,11 +396,11 @@ Task: validate behavior in the exact container image and cluster runtime used by
 
 Subtasks:
 
-- Run `check-deps.sh` in the target image.
-- Run `capture-error-scenarios.sh --all` through `capture-error.sh`.
+- Run `scenarios.sh --all` through `capture-error.sh`.
 - Validate timeout behavior for commands that spawn child processes.
 - Validate capture-limit behavior under expected ephemeral-storage limits.
 - Validate `/tmp` write permissions.
+- Validate that `bin/capture-error` is present in runtime images, or that Go is intentionally available.
 - Validate behavior under restricted security contexts.
 - Document the recommended utility/debug image.
 
@@ -442,8 +411,7 @@ Task: make script health part of the repository checks.
 Subtasks:
 
 - Run `bash -n` for every script in `scripts/capture-error/`.
-- Run automated tests in Python mode.
-- Run automated tests in Bash fallback mode.
+- Run automated tests in Go mode.
 - Validate that wrapper output is parseable JSON.
 - Fail CI on changed exit-code behavior unless intentionally updated.
 - Publish scenario output as a CI artifact only when it is safe to retain.
@@ -478,9 +446,7 @@ Task: treat the wrapper interface as a small compatibility contract.
 
 Subtasks:
 
-- Add a `--version` flag.
 - Add a changelog.
 - Document stable top-level JSON fields.
 - Document stable exit codes.
-- Document differences between Python mode and Bash fallback mode.
 - Add migration notes when JSON fields or exit-code behavior changes.

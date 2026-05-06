@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# scripts/capture-error/capture-error-scenarios.sh
+# scripts/capture-error/scenarios.sh
 # Scenario generator used for local testing of capture-error.sh.
 
 set -uo pipefail
@@ -77,7 +77,7 @@ ERROR_SCENARIOS=(
 show_help() {
   cat <<'EOF'
 Usage:
-  ./scripts/capture-error/capture-error-scenarios.sh [options]
+  ./scripts/capture-error/scenarios.sh [options]
 
 Scenario options:
   --scenario NAME       Run one scenario. Use --list-scenarios to see names.
@@ -95,11 +95,11 @@ Default:
   Print the grouped scenario list in non-interactive runs.
 
 Examples:
-  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
-  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh --scenario success
-  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh --scenario error-log-zero
-  ./scripts/capture-error/capture-error.sh --exit-code-only -- ./scripts/capture-error/capture-error-scenarios.sh --all
-  ./scripts/capture-error/capture-error.sh --timeout 1 -- ./scripts/capture-error/capture-error-scenarios.sh --scenario slow --sleep 10
+  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/scenarios.sh --list-scenarios
+  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/scenarios.sh --scenario success
+  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/scenarios.sh --scenario error-log-zero
+  ./scripts/capture-error/capture-error.sh --exit-code-only -- ./scripts/capture-error/scenarios.sh --all
+  ./scripts/capture-error/capture-error.sh --timeout 1 -- ./scripts/capture-error/scenarios.sh --scenario slow --sleep 10
 EOF
 }
 
@@ -120,8 +120,8 @@ list_scenarios() {
   cat <<'EOF'
 
 Run one scenario by name, for example:
-  scripts/capture-error/capture-error.sh scripts/capture-error/capture-error-scenarios.sh --scenario success
-  scripts/capture-error/capture-error.sh scripts/capture-error/capture-error-scenarios.sh --scenario json-error
+  scripts/capture-error/capture-error.sh scripts/capture-error/scenarios.sh --scenario success
+  scripts/capture-error/capture-error.sh scripts/capture-error/scenarios.sh --scenario json-error
 
 Suite modes:
   --all          Run every non-slow scenario.
