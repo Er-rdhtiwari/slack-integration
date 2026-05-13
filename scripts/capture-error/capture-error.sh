@@ -366,7 +366,7 @@ target_pid=$!
     sleep 2
     kill -KILL "-$target_pid" >/dev/null 2>&1 || kill -KILL "$target_pid" >/dev/null 2>&1 || true
   fi
-) &
+) >/dev/null 2>&1 &
 timeout_watcher_pid=$!
 
 (
@@ -387,7 +387,7 @@ timeout_watcher_pid=$!
 
     sleep 1
   done
-) &
+) >/dev/null 2>&1 &
 capture_watcher_pid=$!
 
 if [ -t 0 ]; then

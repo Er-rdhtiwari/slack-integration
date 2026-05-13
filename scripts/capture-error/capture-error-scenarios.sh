@@ -74,6 +74,9 @@ ERROR_SCENARIOS=(
   signal-term
 )
 
+MENU_SCENARIOS=("${SUCCESS_SCENARIOS[@]}" "${ERROR_SCENARIOS[@]}")
+SUITE_OPTIONS=(all all-success all-failure)
+
 show_help() {
   cat <<'EOF'
 Usage:
@@ -81,6 +84,7 @@ Usage:
 
 Scenario options:
   --scenario NAME       Run one scenario. Use --list-scenarios to see names.
+  test=NUMBER|NAME      Run one scenario or suite by interactive menu number/name.
   --random              Run one random scenario.
   --all                 Run every non-slow scenario.
   --all-success         Run every expected-success scenario except slow.
@@ -97,6 +101,7 @@ Default:
 Examples:
   ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
   ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh --scenario success
+  ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh test=2
   ./scripts/capture-error/capture-error.sh -- ./scripts/capture-error/capture-error-scenarios.sh --scenario error-log-zero
   ./scripts/capture-error/capture-error.sh --exit-code-only -- ./scripts/capture-error/capture-error-scenarios.sh --all
   ./scripts/capture-error/capture-error.sh --timeout 1 -- ./scripts/capture-error/capture-error-scenarios.sh --scenario slow --sleep 10
@@ -132,9 +137,51 @@ Use --random only when you intentionally want a random scenario.
 EOF
 }
 
-select_scenario() {
-  local choices=("${SUCCESS_SCENARIOS[@]}" "${ERROR_SCENARIOS[@]}")
+resolve_scenario_selection() {
   local choice
+  local scenario
+  local suite_start_index
+
+  choice="$1"
+  suite_start_index=$((${#MENU_SCENARIOS[@]} + 1))
+
+  choice="${choice#"${choice%%[![:space:]]*}"}"
+  choice="${choice%"${choice##*[![:space:]]}"}"
+
+  if [ -z "$choice" ]; then
+    echo "No selection received. Use --scenario NAME to run one scenario."
+    return 64
+  fi
+
+  case "$choice" in
+    all|--all|all-success|--all-success|all-failure|--all-failure)
+      selected_scenario="${choice#--}"
+      return 0
+      ;;
+  esac
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge "$suite_start_index" ] && [ "$choice" -lt "$((suite_start_index + ${#SUITE_OPTIONS[@]}))" ]; then
+    selected_scenario="${SUITE_OPTIONS[$((choice - suite_start_index))]}"
+    return 0
+  fi
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#MENU_SCENARIOS[@]}" ]; then
+    selected_scenario="${MENU_SCENARIOS[$((choice - 1))]}"
+    return 0
+  fi
+
+  for scenario in "${MENU_SCENARIOS[@]}"; do
+    if [ "$choice" = "$scenario" ]; then
+      selected_scenario="$scenario"
+      return 0
+    fi
+  done
+
+  echo "Invalid selection '$choice'. Use --list-scenarios to see available names." >&2
+  return 64
+}
+
+print_scenario_menu() {
   local index
   local scenario
   local suite_start_index
@@ -154,11 +201,19 @@ select_scenario() {
   done
 
   echo
-  suite_start_index=$((${#choices[@]} + 1))
-  printf '  %2d. all\n' "$suite_start_index"
-  printf '  %2d. all-success\n' "$((suite_start_index + 1))"
-  printf '  %2d. all-failure\n' "$((suite_start_index + 2))"
+  suite_start_index=$((${#MENU_SCENARIOS[@]} + 1))
+  index=0
+  for scenario in "${SUITE_OPTIONS[@]}"; do
+    printf '  %2d. %s\n' "$((suite_start_index + index))" "$scenario"
+    index=$((index + 1))
+  done
   echo
+}
+
+select_scenario() {
+  local choice
+
+  print_scenario_menu
   printf 'Select scenario number or name: '
 
   if ! IFS= read -r choice; then
@@ -167,50 +222,18 @@ select_scenario() {
     return 64
   fi
 
-  choice="${choice#"${choice%%[![:space:]]*}"}"
-  choice="${choice%"${choice##*[![:space:]]}"}"
+  resolve_scenario_selection "$choice"
+}
 
-  if [ -z "$choice" ]; then
-    echo "No selection received. Use --scenario NAME to run one scenario."
-    return 64
-  fi
-
-  case "$choice" in
-    all|--all|all-success|--all-success|all-failure|--all-failure)
-      selected_scenario="${choice#--}"
-      return 0
+set_mode_from_selection() {
+  case "$1" in
+    all|all-success|all-failure)
+      mode="$1"
+      ;;
+    *)
+      mode="scenario"
       ;;
   esac
-
-  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge "$suite_start_index" ] && [ "$choice" -le "$((suite_start_index + 2))" ]; then
-    case "$choice" in
-      "$suite_start_index")
-        selected_scenario="all"
-        ;;
-      "$((suite_start_index + 1))")
-        selected_scenario="all-success"
-        ;;
-      "$((suite_start_index + 2))")
-        selected_scenario="all-failure"
-        ;;
-    esac
-    return 0
-  fi
-
-  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#choices[@]}" ]; then
-    selected_scenario="${choices[$((choice - 1))]}"
-    return 0
-  fi
-
-  for scenario in "${choices[@]}"; do
-    if [ "$choice" = "$scenario" ]; then
-      selected_scenario="$scenario"
-      return 0
-    fi
-  done
-
-  echo "Invalid selection '$choice'. Use --list-scenarios to see available names." >&2
-  return 64
 }
 
 scenario_success() {
@@ -565,6 +588,55 @@ pick_random_scenario() {
   printf '%s\n' "${SCENARIOS[$index]}"
 }
 
+run_mode() {
+  local status
+
+  case "$mode" in
+    select)
+      if [ -t 0 ]; then
+        select_scenario
+        status=$?
+
+        if [ "$status" -ne 0 ]; then
+          exit "$status"
+        fi
+
+        scenario="$selected_scenario"
+        set_mode_from_selection "$scenario"
+        echo
+        echo "Selected scenario: $scenario"
+        run_mode
+        exit $?
+      fi
+
+      list_scenarios
+      exit 0
+      ;;
+    list)
+      list_scenarios
+      exit 0
+      ;;
+    all|all-success|all-failure)
+      run_suite "$mode" "$sleep_seconds" "$include_slow"
+      exit $?
+      ;;
+    random)
+      scenario="$(pick_random_scenario)"
+      echo "Selected random scenario: $scenario"
+      run_scenario "$scenario" "$sleep_seconds"
+      exit $?
+      ;;
+    scenario)
+      run_scenario "$scenario" "$sleep_seconds"
+      exit $?
+      ;;
+    *)
+      echo "Error: Unknown mode '$mode'." >&2
+      exit 64
+      ;;
+  esac
+}
+
 scenario=""
 selected_scenario=""
 mode="select"
@@ -581,6 +653,14 @@ while [[ $# -gt 0 ]]; do
       scenario="$2"
       mode="scenario"
       shift 2
+      ;;
+    test=*)
+      if ! resolve_scenario_selection "${1#test=}"; then
+        exit 64
+      fi
+      scenario="$selected_scenario"
+      set_mode_from_selection "$scenario"
+      shift
       ;;
     --random)
       mode="random"
@@ -626,58 +706,4 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "$mode" in
-  select)
-    if [ -t 0 ]; then
-      select_scenario
-      status=$?
-
-      if [ "$status" -ne 0 ]; then
-        exit "$status"
-      fi
-
-      scenario="$selected_scenario"
-      echo
-      echo "Selected scenario: $scenario"
-
-      case "$scenario" in
-        all|all-success|all-failure)
-          run_suite "$scenario" "$sleep_seconds" "$include_slow"
-          exit $?
-          ;;
-      esac
-
-      run_scenario "$scenario" "$sleep_seconds"
-      exit $?
-    fi
-
-    list_scenarios
-    exit 0
-    ;;
-  list)
-    list_scenarios
-    exit 0
-    ;;
-  all)
-    run_suite all "$sleep_seconds" "$include_slow"
-    exit $?
-    ;;
-  all-success)
-    run_suite all-success "$sleep_seconds" "$include_slow"
-    exit $?
-    ;;
-  all-failure)
-    run_suite all-failure "$sleep_seconds" "$include_slow"
-    exit $?
-    ;;
-  random)
-    scenario="$(pick_random_scenario)"
-    echo "Selected random scenario: $scenario"
-    run_scenario "$scenario" "$sleep_seconds"
-    exit $?
-    ;;
-  scenario)
-    run_scenario "$scenario" "$sleep_seconds"
-    exit $?
-    ;;
-esac
+run_mode

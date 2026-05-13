@@ -34,6 +34,8 @@ scripts/capture-error/
   capture-error-bash.sh        No-Python fallback, used automatically.
   check-deps.sh                Dependency check.
   capture-error-scenarios.sh   Scenario generator for local testing.
+  status.sh                    Minimal example for capturing final JSON in a variable.
+  status-advanced.sh           Advanced example showing optimized CI/Tekton pattern.
   README.md
 ```
 
@@ -69,12 +71,13 @@ Responsibilities:
 - Supports the same core wrapper flags as `capture-error.sh`.
 - Captures bounded stdout/stderr.
 - Performs text-pattern error and warning detection.
+- Detects common JSON `level`, `severity`, and `log_level` error/warning fields.
 - Applies built-in and custom redaction patterns.
 - Emits JSON with `"fallback_mode": "bash"`.
 
 Limitations:
 
-- Does not parse structured JSON logs as deeply as Python mode.
+- Does not parse or redact structured JSON logs as deeply as Python mode.
 - Uses `sed -E` for custom redaction patterns, so regex syntax should stay portable.
 - Produces a smaller JSON shape than Python mode.
 
@@ -120,12 +123,33 @@ Examples:
 ```bash
 ./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
 ./scripts/capture-error/capture-error-scenarios.sh --scenario success
+./scripts/capture-error/capture-error-scenarios.sh test=2
 ./scripts/capture-error/capture-error-scenarios.sh --all-success
 ./scripts/capture-error/capture-error-scenarios.sh --all-failure
 ./scripts/capture-error/capture-error-scenarios.sh --all
 ```
 
-When no scenario is provided, the script prompts for a scenario in a terminal. In non-interactive runs, it lists grouped success/error choices instead of choosing randomly.
+Use `test=NUMBER` to run the same numbered item shown in the interactive menu, or `test=NAME` to run a scenario or suite by name. When no scenario is provided, the script prompts for a scenario in a terminal. In non-interactive runs, it lists grouped success/error choices instead of choosing randomly.
+
+### `status-advanced.sh`
+
+Advanced example demonstrating the optimized pattern for CI/Tekton integration.
+
+Responsibilities:
+
+- Shows reusable `run_test()` function pattern.
+- Demonstrates status checking from JSON output.
+- Shows base64 encoding for safe pipeline transmission.
+- Implements stop-on-first-failure behavior.
+- Separates simple error messages from detailed JSON traces.
+
+Example:
+
+```bash
+./scripts/capture-error/status-advanced.sh
+```
+
+This script serves as a reference implementation for the Tekton integration pattern documented below.
 
 ## Requirements
 
@@ -318,6 +342,15 @@ Run one scenario:
   ./scripts/capture-error/capture-error-scenarios.sh --scenario success
 ```
 
+Run one scenario by interactive menu number:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh test=2
+```
+
+The interactive menu currently contains 29 scenarios followed by 3 suite entries: `all`, `all-success`, and `all-failure`. That means `test=30`, `test=31`, and `test=32` run those suites by number.
+
 Run expected-success coverage:
 
 ```bash
@@ -398,6 +431,111 @@ command -v python3  # optional, enables Python mode
 ```
 
 For production support usage, prefer a dedicated utility/debug image instead of adding Bash/Python to a minimal application image.
+
+## Tekton Integration
+
+The `capture-error.sh` wrapper integrates well with Tekton pipelines for validation tasks. Here's a recommended pattern:
+
+### Optimized Test Runner Pattern
+
+Create a reusable function in your Tekton task that:
+- Wraps test commands with `capture-error.sh`
+- Captures full JSON output for debugging
+- Writes simple error messages and detailed JSON to separate result parameters
+- Stops on first failure
+
+Example from `.tekton/task-validate-check.yaml`:
+
+```yaml
+spec:
+  results:
+    - name: error-message
+      description: Short error message if validation fails
+    - name: error-trace
+      description: Full error details in JSON format
+  steps:
+    - name: validate-check
+      script: |
+        #!/usr/bin/env bash
+        set -eo pipefail
+        
+        # Function to run a test and check its status
+        run_test() {
+          local test_number="$1"
+          local scenario_args="$2"
+          
+          # Build the full command with the capture-error wrapper
+          local full_command="./scripts/capture-error/capture-error.sh --stdout true -- ./scripts/capture-error/capture-error-scenarios.sh ${scenario_args}"
+          
+          echo "Running: Test:${test_number}  ${full_command}"
+          local test_status
+          test_status="$(eval "${full_command}" || true)"
+          echo "$test_status"
+          
+          # Check test status
+          if echo "$test_status" | grep -q '"status": "success"'; then
+            echo "✓ Test ${test_number}: SUCCESS"
+            return 0
+          else
+            echo "✗ Test ${test_number}: FAILED"
+            
+            # Write simple error message
+            echo -n "Script execution failed: ${full_command}" > $(results.error-message.path)
+            
+            # Base64 encode the full JSON for error trace
+            local encoded_json
+            encoded_json=$(echo "$test_status" | base64 -w 0 2>/dev/null || echo "$test_status" | base64)
+            
+            # Write base64-encoded JSON to error-trace result
+            echo -n "BASE64:${encoded_json}" > $(results.error-trace.path)
+            
+            return 1
+          fi
+        }
+        
+        # Run tests - stop on first failure
+        run_test "5" "test=5"
+        run_test "20" "test=20"
+        run_test "6" "test=6"
+```
+
+### Benefits of This Pattern
+
+- **DRY principle**: Test execution logic defined once in `run_test()` function
+- **Stop on failure**: Tests stop at first failure, saving CI time
+- **Complete context**: Full JSON available for debugging via base64-encoded error-trace
+- **Clean notifications**: Simple error message for Slack/notifications, detailed JSON for debugging
+- **Safe transmission**: Base64 encoding prevents shell interpretation issues in pipelines
+
+### Decoding in Notification Systems
+
+When consuming the base64-encoded JSON in Go-based notifiers:
+
+```go
+import (
+    "encoding/base64"
+    "encoding/json"
+    "strings"
+)
+
+// Process error trace (may contain BASE64-encoded JSON)
+decodedErrorTrace := strings.TrimSpace(errorTrace)
+
+if strings.HasPrefix(decodedErrorTrace, "BASE64:") {
+    encodedPart := strings.TrimPrefix(decodedErrorTrace, "BASE64:")
+    decoded, err := base64.StdEncoding.DecodeString(encodedPart)
+    if err == nil {
+        // Pretty-print JSON for notifications
+        var jsonData interface{}
+        if err := json.Unmarshal(decoded, &jsonData); err == nil {
+            prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
+            decodedErrorTrace = string(prettyJSON)
+        }
+    }
+}
+```
+
+This approach uses only Go standard library packages (`encoding/base64`, `encoding/json`, `strings`).
 
 ## Future Development
 

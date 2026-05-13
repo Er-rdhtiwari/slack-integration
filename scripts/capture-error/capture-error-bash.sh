@@ -157,7 +157,7 @@ detect_error_lines() {
     return
   fi
 
-  printf '%s\n' "$text" | grep -Eic '^[[:space:]]*(\[[^]]+\][[:space:]]*)?(error|err|failed|failure|fatal|panic|exception)([[:space:]]*[:=-]|[[:space:]]+|$)|traceback \(most recent call last\)|unhandled(promise)?rejection|panic:|fatal:' || true
+  printf '%s\n' "$text" | grep -Eic '^[[:space:]]*(\[[^]]+\][[:space:]]*)?(error|err|failed|failure|fatal|panic|exception)([[:space:]]*[:=-]|[[:space:]]+|$)|["'\''](level|severity|log_level)["'\''][[:space:]]*:[[:space:]]*["'\''](error|err|fatal|panic)["'\'']|traceback \(most recent call last\)|unhandled(promise)?rejection|panic:|fatal:' || true
 }
 
 detect_warning_lines() {
@@ -168,7 +168,7 @@ detect_warning_lines() {
     return
   fi
 
-  printf '%s\n' "$text" | grep -Eic '^[[:space:]]*(\[[^]]+\][[:space:]]*)?(warn|warning|deprecationwarning)([[:space:]]*[:=-]|[[:space:]]+|$)' || true
+  printf '%s\n' "$text" | grep -Eic '^[[:space:]]*(\[[^]]+\][[:space:]]*)?(warn|warning|deprecationwarning)([[:space:]]*[:=-]|[[:space:]]+|$)|["'\''](level|severity|log_level)["'\''][[:space:]]*:[[:space:]]*["'\''](warn|warning)["'\'']' || true
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -324,7 +324,7 @@ target_pid=$!
     sleep 2
     kill -KILL "-$target_pid" >/dev/null 2>&1 || kill -KILL "$target_pid" >/dev/null 2>&1 || true
   fi
-) &
+) >/dev/null 2>&1 &
 timeout_watcher_pid=$!
 
 (
@@ -343,7 +343,7 @@ timeout_watcher_pid=$!
 
     sleep 1
   done
-) &
+) >/dev/null 2>&1 &
 capture_watcher_pid=$!
 
 if [ -t 0 ]; then
