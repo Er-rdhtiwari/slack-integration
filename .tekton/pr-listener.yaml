@@ -1,0 +1,13 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: pr-listener
+  namespace: slack-integration-dev
+spec:
+  serviceAccountName: slack-notifier-sa
+  triggers: 
+    - name: pr-trigger
+      bindings:
+        - ref: pr-binding
+      template:
+        ref: pr-trigger-template

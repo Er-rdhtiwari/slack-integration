@@ -1,0 +1,624 @@
+# capture-error
+
+`capture-error` wraps a command, captures stdout/stderr, detects common error logs, redacts common secrets, and prints a bounded JSON result. It is designed for CI, Kubernetes jobs, internal automation, and controlled production support diagnostics.
+
+## Production Status
+
+Acceptable for:
+
+- CI and Tekton-style jobs
+- Kubernetes debug/support jobs
+- short-lived operational diagnostics
+- controlled production support tasks with explicit limits
+
+Not intended as:
+
+- a general production logging pipeline
+- a compliance-grade DLP or secret-scanning control
+- the only failure detector for critical workflows
+- a long-running daemon or sidecar
+
+Recommended production-support defaults:
+
+```bash
+CAPTURE_ERROR_MAX_OUTPUT_BYTES=65536
+CAPTURE_ERROR_MAX_CAPTURE_BYTES=10485760
+CAPTURE_ERROR_REDACTION_REGEX_FILE=/path/to/redaction-patterns.txt
+```
+
+## Files
+
+```text
+scripts/capture-error/
+  capture-error.sh             Main wrapper. Uses Python mode when available.
+  capture-error-bash.sh        No-Python fallback, used automatically.
+  check-deps.sh                Dependency check.
+  capture-error-scenarios.sh   Scenario generator for local testing.
+  status.sh                    Minimal example for capturing final JSON in a variable.
+  status-advanced.sh           Advanced example showing optimized CI/Tekton pattern.
+  README.md
+```
+
+## Script Details
+
+### `capture-error.sh`
+
+Main entrypoint for normal use.
+
+Responsibilities:
+
+- Parses wrapper flags.
+- Runs `check-deps.sh` unless `CAPTURE_ERROR_SKIP_DEPS_CHECK=true`.
+- Uses Python mode when `python3` and required standard-library modules are available.
+- Automatically delegates to `capture-error-bash.sh` when Python mode is unavailable.
+- Captures stdout/stderr into temporary files.
+- Enforces timeout and capture-size limits.
+- Redacts command arguments and captured output.
+- Emits the final JSON result.
+
+Use this script from CI, Kubernetes jobs, and support automation:
+
+```bash
+./scripts/capture-error/capture-error.sh -- ./my-command --flag value
+```
+
+### `capture-error-bash.sh`
+
+Fallback implementation for images without Python.
+
+Responsibilities:
+
+- Supports the same core wrapper flags as `capture-error.sh`.
+- Captures bounded stdout/stderr.
+- Performs text-pattern error and warning detection.
+- Detects common JSON `level`, `severity`, and `log_level` error/warning fields.
+- Applies built-in and custom redaction patterns.
+- Emits JSON with `"fallback_mode": "bash"`.
+
+Limitations:
+
+- Does not parse or redact structured JSON logs as deeply as Python mode.
+- Uses `sed -E` for custom redaction patterns, so regex syntax should stay portable.
+- Produces a smaller JSON shape than Python mode.
+
+Call it directly only when testing fallback behavior:
+
+```bash
+./scripts/capture-error/capture-error-bash.sh -- ./my-command
+```
+
+### `check-deps.sh`
+
+Dependency checker for the wrapper package.
+
+Responsibilities:
+
+- Verifies common shell dependencies.
+- Reports whether Python mode is available.
+- Reports whether Bash fallback dependencies are available.
+- Emits JSON with `success`, `status`, `missing`, `failed_checks`, `python_available`, `fallback_missing`, `fallback_available`, and `install_hints`.
+
+Example:
+
+```bash
+./scripts/capture-error/check-deps.sh
+```
+
+### `capture-error-scenarios.sh`
+
+Scenario generator for local validation and future automated tests.
+
+Responsibilities:
+
+- Produces known stdout/stderr patterns.
+- Produces warning and error-like logs.
+- Produces JSON log examples.
+- Produces secret-redaction examples.
+- Produces timeout and non-zero-exit scenarios.
+- Produces large-output and no-newline scenarios.
+- Supports focused suites for expected-success, expected-failure, and full non-slow coverage.
+
+Examples:
+
+```bash
+./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
+./scripts/capture-error/capture-error-scenarios.sh --scenario success
+./scripts/capture-error/capture-error-scenarios.sh test=2
+./scripts/capture-error/capture-error-scenarios.sh --all-success
+./scripts/capture-error/capture-error-scenarios.sh --all-failure
+./scripts/capture-error/capture-error-scenarios.sh --all
+```
+
+Use `test=NUMBER` to run the same numbered item shown in the interactive menu, or `test=NAME` to run a scenario or suite by name. When no scenario is provided, the script prompts for a scenario in a terminal. In non-interactive runs, it lists grouped success/error choices instead of choosing randomly.
+
+### `status-advanced.sh`
+
+Advanced example demonstrating the optimized pattern for CI/Tekton integration.
+
+Responsibilities:
+
+- Shows reusable `run_test()` function pattern.
+- Demonstrates status checking from JSON output.
+- Shows base64 encoding for safe pipeline transmission.
+- Implements stop-on-first-failure behavior.
+- Separates simple error messages from detailed JSON traces.
+
+Example:
+
+```bash
+./scripts/capture-error/status-advanced.sh
+```
+
+This script serves as a reference implementation for the Tekton integration pattern documented below.
+
+## Requirements
+
+Common requirements:
+
+- `bash`
+- `date`
+- `mktemp`
+- `rm`
+- `kill`
+- `sleep`
+- `wc`
+- writable temp directory, normally `/tmp`
+
+Python mode additionally requires `python3`. It uses only Python standard library modules.
+
+Bash fallback mode additionally uses common shell utilities: `awk`, `dd`, `grep`, `sed`, and `tr`.
+
+Check dependencies:
+
+```bash
+./scripts/capture-error/check-deps.sh
+```
+
+## Quick Start
+
+```bash
+./scripts/capture-error/capture-error.sh -- echo "hello"
+```
+
+Use `--` when the wrapped command has flags:
+
+```bash
+./scripts/capture-error/capture-error.sh -- ./my-command --flag value
+```
+
+Skip the automatic dependency check:
+
+```bash
+CAPTURE_ERROR_SKIP_DEPS_CHECK=true ./scripts/capture-error/capture-error.sh -- echo "hello"
+```
+
+## Wrapper Flags
+
+```text
+--strict-log-errors       Fail when error-like logs are detected. Default.
+--exit-code-only          Fail only when the command exits non-zero.
+--stream-output           Mirror raw command stdout/stderr live to stderr, then print final JSON to stdout. Default.
+--no-stream-output        Capture command output silently, then print only final JSON.
+--stdout true|false       Include captured stdout text in final JSON output. Default: false.
+--stderr true|false       Include captured stderr text in final JSON output. Default: true.
+--timeout SECONDS         Stop the command after this many seconds. Default: 3600.
+--max-output-bytes BYTES  Max bytes returned per stream in JSON. Default: 65536.
+--max-capture-bytes BYTES Max combined stdout/stderr temp bytes before terminating. Default: 10485760.
+--redaction-regex-file PATH
+                           Extra redaction regex patterns, one per line.
+-h, --help                Show help.
+```
+
+Environment defaults:
+
+```bash
+CAPTURE_ERROR_MAX_OUTPUT_BYTES=65536
+CAPTURE_ERROR_MAX_CAPTURE_BYTES=10485760
+CAPTURE_ERROR_REDACTION_REGEX_FILE=/path/to/redaction-patterns.txt
+```
+
+## JSON Result
+
+The wrapper prints JSON to stdout and exits with `wrapper_exit_code`.
+
+Command logs are streamed while the process is still running:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario slow
+```
+
+Live command output is mirrored to stderr so stdout can still be parsed as the final JSON result. Streamed output is raw terminal output; redaction still applies to the final JSON. Use `--no-stream-output` to restore the old silent capture behavior.
+
+Important fields:
+
+- `success` - final boolean result.
+- `status` - `success` or `failed`.
+- `exit_code` - exit code from the wrapped command.
+- `wrapper_exit_code` - exit code from `capture-error.sh`.
+- `failure_reason` - failure category, for example `timeout`, `non_zero_exit_code`, `error_log_detected`, or `capture_limit_exceeded`.
+- `summary.stdout_raw_bytes` and `summary.stderr_raw_bytes` - raw captured byte counts.
+- `summary.output_truncated` - whether captured stdout or stderr exceeded `--max-output-bytes`.
+- `output.stdout` - captured, redacted stdout, present only with `--stdout true`.
+- `output.stderr` - captured, redacted stderr, present by default and removed with `--stderr false`.
+- `fallback_mode` - present as `"bash"` when Python mode is unavailable.
+
+## Exit Codes
+
+```text
+0     Success.
+1     Strict log detection failed while command exited 0.
+64    Wrapper usage error.
+70    Wrapper setup or dependency failure.
+124   Timeout.
+125   Capture limit exceeded.
+other Wrapped command exit code.
+```
+
+## Output Limits
+
+There are two separate limits:
+
+- `--max-output-bytes` limits how many bytes per stream can be returned in JSON when that stream is included.
+- `--max-capture-bytes` limits combined raw stdout/stderr captured in temp files. When exceeded, the command is terminated and the wrapper exits `125`.
+
+Examples:
+
+```bash
+./scripts/capture-error/capture-error.sh --max-output-bytes 32768 -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario large-output
+```
+
+```bash
+./scripts/capture-error/capture-error.sh --max-capture-bytes 1048576 -- \
+  ./some-noisy-command
+```
+
+The capture-size watcher checks periodically, so raw files can exceed the limit slightly before termination.
+
+## Redaction
+
+Built-in redaction covers common sensitive values:
+
+- Slack webhook URLs
+- bearer tokens
+- API keys
+- access and refresh tokens
+- passwords
+- fields named `secret`, `token`, `api_key`, `password`, and similar names
+
+Add project-specific patterns:
+
+```bash
+cat > /tmp/capture-redaction-patterns.txt <<'EOF'
+customer_id=[A-Za-z0-9_-]+
+internal_ticket=[A-Z]+-[0-9]+
+EOF
+
+./scripts/capture-error/capture-error.sh \
+  --redaction-regex-file /tmp/capture-redaction-patterns.txt \
+  -- ./some-command
+```
+
+Redaction is best-effort. Treat captured JSON as sensitive data.
+
+## Strict Log Detection
+
+Default behavior fails the wrapper if the command exits `0` but emits error-like logs:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario error-log-zero
+```
+
+Use exit-code-only mode to ignore error-like logs:
+
+```bash
+./scripts/capture-error/capture-error.sh --exit-code-only -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario error-log-zero
+```
+
+## Timeout
+
+```bash
+./scripts/capture-error/capture-error.sh --timeout 1 -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario slow --sleep 10
+```
+
+Timeout failures exit `124`.
+
+## Scenario Testing
+
+List grouped scenarios:
+
+```bash
+./scripts/capture-error/capture-error-scenarios.sh --list-scenarios
+```
+
+Run one scenario:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --scenario success
+```
+
+Run one scenario by interactive menu number:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh test=2
+```
+
+The interactive menu currently contains 29 scenarios followed by 3 suite entries: `all`, `all-success`, and `all-failure`. That means `test=30`, `test=31`, and `test=32` run those suites by number.
+
+Run expected-success coverage:
+
+```bash
+./scripts/capture-error/capture-error.sh -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --all-success
+```
+
+Run expected-failure coverage:
+
+```bash
+./scripts/capture-error/capture-error.sh --exit-code-only -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --all-failure
+```
+
+Run broad coverage:
+
+```bash
+./scripts/capture-error/capture-error.sh --exit-code-only -- \
+  ./scripts/capture-error/capture-error-scenarios.sh --all
+```
+
+Add `--include-slow --sleep SECONDS` to include the slow scenario in `--all` or `--all-success`.
+
+Available scenarios:
+
+```text
+Expected success scenarios:
+  - success
+  - stderr-info
+  - warning
+  - multi-warning
+  - json-info
+  - json-warning
+  - json-array
+  - invalid-json
+  - large-output
+  - interleaved-output
+  - progress
+  - carriage-return
+  - no-newline
+  - empty-output
+  - slow
+
+Expected failure scenarios:
+  - error-log-zero
+  - stderr-error-zero
+  - fatal-text-zero
+  - json-error
+  - json-fatal
+  - json-nested-secret
+  - traceback
+  - multiline-stack
+  - secret
+  - command-not-found-text
+  - mixed
+  - nonzero
+  - nonzero-no-output
+  - signal-term
+```
+
+## Kubernetes Notes
+
+`capture-error.sh` works in Kubernetes when the image includes the common requirements. If `python3` is missing, it automatically switches to `capture-error-bash.sh`.
+
+Images that usually need extra care:
+
+- `scratch`
+- `distroless`
+- Alpine images without Bash installed
+
+Container checks:
+
+```bash
+command -v bash
+command -v mktemp
+test -w /tmp
+command -v python3  # optional, enables Python mode
+```
+
+For production support usage, prefer a dedicated utility/debug image instead of adding Bash/Python to a minimal application image.
+
+## Tekton Integration
+
+The `capture-error.sh` wrapper integrates well with Tekton pipelines for validation tasks. Here's a recommended pattern:
+
+### Optimized Test Runner Pattern
+
+Create a reusable function in your Tekton task that:
+- Wraps test commands with `capture-error.sh`
+- Captures full JSON output for debugging
+- Writes simple error messages and detailed JSON to separate result parameters
+- Stops on first failure
+
+Example from `.tekton/task-validate-check.yaml`:
+
+```yaml
+spec:
+  results:
+    - name: error-message
+      description: Short error message if validation fails
+    - name: error-trace
+      description: Full error details in JSON format
+  steps:
+    - name: validate-check
+      script: |
+        #!/usr/bin/env bash
+        set -eo pipefail
+        
+        # Function to run a test and check its status
+        run_test() {
+          local test_number="$1"
+          local scenario_args="$2"
+          
+          # Build the full command with the capture-error wrapper
+          local full_command="./scripts/capture-error/capture-error.sh --stdout true -- ./scripts/capture-error/capture-error-scenarios.sh ${scenario_args}"
+          
+          echo "Running: Test:${test_number}  ${full_command}"
+          local test_status
+          test_status="$(eval "${full_command}" || true)"
+          echo "$test_status"
+          
+          # Check test status
+          if echo "$test_status" | grep -q '"status": "success"'; then
+            echo "✓ Test ${test_number}: SUCCESS"
+            return 0
+          else
+            echo "✗ Test ${test_number}: FAILED"
+            
+            # Write simple error message
+            echo -n "Script execution failed: ${full_command}" > $(results.error-message.path)
+            
+            # Base64 encode the full JSON for error trace
+            local encoded_json
+            encoded_json=$(echo "$test_status" | base64 -w 0 2>/dev/null || echo "$test_status" | base64)
+            
+            # Write base64-encoded JSON to error-trace result
+            echo -n "BASE64:${encoded_json}" > $(results.error-trace.path)
+            
+            return 1
+          fi
+        }
+        
+        # Run tests - stop on first failure
+        run_test "5" "test=5"
+        run_test "20" "test=20"
+        run_test "6" "test=6"
+```
+
+### Benefits of This Pattern
+
+- **DRY principle**: Test execution logic defined once in `run_test()` function
+- **Stop on failure**: Tests stop at first failure, saving CI time
+- **Complete context**: Full JSON available for debugging via base64-encoded error-trace
+- **Clean notifications**: Simple error message for Slack/notifications, detailed JSON for debugging
+- **Safe transmission**: Base64 encoding prevents shell interpretation issues in pipelines
+
+### Decoding in Notification Systems
+
+When consuming the base64-encoded JSON in Go-based notifiers:
+
+```go
+import (
+    "encoding/base64"
+    "encoding/json"
+    "strings"
+)
+
+// Process error trace (may contain BASE64-encoded JSON)
+decodedErrorTrace := strings.TrimSpace(errorTrace)
+
+if strings.HasPrefix(decodedErrorTrace, "BASE64:") {
+    encodedPart := strings.TrimPrefix(decodedErrorTrace, "BASE64:")
+    decoded, err := base64.StdEncoding.DecodeString(encodedPart)
+    if err == nil {
+        // Pretty-print JSON for notifications
+        var jsonData interface{}
+        if err := json.Unmarshal(decoded, &jsonData); err == nil {
+            prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
+            decodedErrorTrace = string(prettyJSON)
+        }
+    }
+}
+```
+
+This approach uses only Go standard library packages (`encoding/base64`, `encoding/json`, `strings`).
+
+## Future Development
+
+Recommended follow-up tasks are listed below. These are future hardening items, not current blockers for controlled CI/Kubernetes/support usage.
+
+### 1. Automated Test Suite
+
+Task: add `test-capture-error.sh` for repeatable local and CI validation.
+
+Subtasks:
+
+- Assert success-path JSON fields.
+- Assert non-zero command exit handling.
+- Assert strict text-log error detection.
+- Assert strict JSON-log error detection in Python mode.
+- Assert `--exit-code-only` behavior.
+- Assert timeout behavior and exit code `124`.
+- Assert capture-limit behavior and exit code `125`.
+- Assert `--max-output-bytes` truncation metadata.
+- Assert default redaction for Slack webhooks, bearer tokens, API keys, and passwords.
+- Assert custom redaction with `--redaction-regex-file`.
+- Assert automatic Bash fallback when `python3` is unavailable.
+
+### 2. Kubernetes Runtime Validation
+
+Task: validate behavior in the exact container image and cluster runtime used by CI/support jobs.
+
+Subtasks:
+
+- Run `check-deps.sh` in the target image.
+- Run `capture-error-scenarios.sh --all` through `capture-error.sh`.
+- Validate timeout behavior for commands that spawn child processes.
+- Validate capture-limit behavior under expected ephemeral-storage limits.
+- Validate `/tmp` write permissions.
+- Validate behavior under restricted security contexts.
+- Document the recommended utility/debug image.
+
+### 3. CI Integration
+
+Task: make script health part of the repository checks.
+
+Subtasks:
+
+- Run `bash -n` for every script in `scripts/capture-error/`.
+- Run automated tests in Python mode.
+- Run automated tests in Bash fallback mode.
+- Validate that wrapper output is parseable JSON.
+- Fail CI on changed exit-code behavior unless intentionally updated.
+- Publish scenario output as a CI artifact only when it is safe to retain.
+
+### 4. Redaction Hardening
+
+Task: make redaction policy explicit and testable for this repository.
+
+Subtasks:
+
+- Add a repo-owned redaction pattern file.
+- Add company/project-specific token and identifier formats.
+- Add tests for every supported redaction pattern.
+- Decide whether invalid custom regex patterns should fail closed.
+- Consider a `--no-output` or `--summary-only` mode for sensitive workflows.
+
+### 5. Output and Storage Policy
+
+Task: define where captured JSON can safely go.
+
+Subtasks:
+
+- Define default `CAPTURE_ERROR_MAX_OUTPUT_BYTES` per environment.
+- Define default `CAPTURE_ERROR_MAX_CAPTURE_BYTES` per environment.
+- Document approved storage locations for captured JSON.
+- Document retention expectations.
+- Add examples for storing only summary fields in sensitive pipelines.
+
+### 6. Release and Compatibility
+
+Task: treat the wrapper interface as a small compatibility contract.
+
+Subtasks:
+
+- Add a `--version` flag.
+- Add a changelog.
+- Document stable top-level JSON fields.
+- Document stable exit codes.
+- Document differences between Python mode and Bash fallback mode.
+- Add migration notes when JSON fields or exit-code behavior changes.

@@ -1,0 +1,30 @@
+apiVersion : triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pr-binding 
+  namespace: slack-integration-dev
+spec:
+  params:
+    - name: repo-url
+      value: $(body.repository.clone_url)
+
+    - name: repo-full-name
+      value: $(body.repository.full_name)
+
+    - name: pr-number
+      value: $(body.pull_request.number)
+
+    - name: commit-id
+      value: $(body.pull_request.head.sha)
+
+    - name: source-branch
+      value: $(body.pull_request.head.ref)
+
+    - name: target-branch
+      value: $(body.pull_request.base.ref)
+
+    - name: sender
+      value: $(body.sender.login)
+
+    - name: action
+      value: $(body.action)
