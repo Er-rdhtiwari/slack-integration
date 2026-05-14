@@ -1,45 +1,378 @@
 # slack-integration
 
-Kubernetes and Tekton manifests for testing pull request webhook events in the `slack-integration-dev` namespace.
+`slack-integration` is a Go-based Slack notification utility plus Kubernetes/Tekton manifests and helper scripts for testing PR-triggered pipelines and reporting failures.
 
-The current Tekton flow is:
+The repository currently supports two related workflows:
 
-```text
-HTTP PR webhook request
--> Tekton EventListener
--> TriggerBinding extracts fields from JSON
--> TriggerTemplate creates PipelineRun
--> Pipeline prints PR information
-```
+- A Tekton Trigger flow that accepts a GitHub-style pull request webhook and starts a sample `PipelineRun`.
+- A `slack-notifier` CLI that sends Slack webhook messages for normal pipeline events or rich Tekton failure contexts.
 
-Important: the current `.tekton/pr-pipeline.yaml` only prints PR details. It does not send a Slack notification yet. Slack notification requires adding a Slack step/task or calling the Go notifier service.
+Important current boundary: the sample Tekton pipeline prints PR details only. It does not yet run the Go notifier automatically. Slack delivery works through the CLI today, and the pipeline can be extended later to call that CLI or a containerized notifier step.
 
 ## Repository Layout
 
-- `k8s/namespace.yaml`: creates `slack-integration-dev`
-- `k8s/serviceaccount.yaml`: creates `slack-notifier-sa`
-- `k8s/eventlistener-rbac.yaml`: grants Tekton EventListener permissions to `slack-notifier-sa`
-- `k8s/configmap.yaml`: non-secret app config
-- `k8s/secret.yaml`: Slack webhook secret placeholders
-- `k8s/deployment.yaml`: test deployment for the Slack notifier app wiring
-- `.tekton/pr-pipeline.yaml`: PR validation Pipeline
-- `.tekton/pr-binding.yaml`: maps webhook JSON fields to Trigger params
-- `.tekton/pr-trigger-template.yaml`: creates a PipelineRun
-- `.tekton/pr-listener.yaml`: exposes the EventListener
+```text
+.
+  cmd/slack-notifier/          CLI entrypoint for Slack notifications.
+  internal/failure/            Tekton failure context parsing, redaction, trace trimming.
+  internal/notify/slack/       Slack Block Kit formatting for rich failure messages.
+  pkg/config/                  Environment-based application configuration.
+  pkg/logger/                  zerolog logger setup and event fields.
+  pkg/notify/model/            Pipeline event model and validation.
+  pkg/notify/router/           Event-type to Slack webhook routing.
+  pkg/notify/slack/            Reusable Slack webhook client and pipeline message builder.
+  pkg/status/                  Small pipeline status tracker.
+  scripts/collect-failure.sh   Collect a failed Tekton TaskRun into JSON.
+  scripts/capture-error/       Generic command wrapper for structured error capture.
+  scripts/test-all.sh          Local validation runner for Go, scripts, YAML, and smoke tests.
+  k8s/                         Namespace, service account, RBAC, and secret manifests.
+  .tekton/                     PR TriggerBinding, TriggerTemplate, EventListener, and Pipeline.
+```
 
-## Prerequisites
+## How The Pieces Fit Together
 
-- A working Kubernetes cluster.
-- `kubectl` configured for the target cluster.
-- Cluster-admin access, or equivalent permission to install CRDs and cluster RBAC.
-- Kubernetes `1.28+` when using the latest Tekton release.
+For pull request testing:
 
-Check cluster access:
+```text
+GitHub-style PR JSON
+  -> Tekton EventListener
+  -> TriggerBinding extracts fields
+  -> TriggerTemplate creates PipelineRun
+  -> Pipeline prints PR metadata
+```
+
+For Slack notification:
+
+```text
+normal event flags
+  -> slack-notifier
+  -> pkg/notify/router selects webhook
+  -> pkg/notify/slack sends Slack attachment payload
+```
+
+For Tekton failure notification:
+
+```text
+failed TaskRun
+  -> scripts/collect-failure.sh emits JSON
+  -> slack-notifier --failure-context-file -
+  -> internal/failure masks and trims details
+  -> internal/notify/slack builds Slack blocks
+  -> pkg/notify/slack sends webhook payload
+```
+
+## Requirements
+
+For Go development:
+
+- Go `1.25.7` or compatible with `go.mod`
+- Bash
+- jq
+- Ruby, used by `scripts/test-all.sh` for YAML syntax parsing
+
+For Kubernetes/Tekton testing:
+
+- kubectl
+- A Kubernetes cluster
+- Tekton Pipelines installed
+- Tekton Triggers installed
+- Permissions to create namespaces, RBAC, EventListeners, TriggerBindings, TriggerTemplates, and PipelineRuns
+
+For Slack delivery:
+
+- Slack incoming webhook URL for PR notifications
+- Slack incoming webhook URL for CD/job/failure notifications
+
+## Configuration
+
+The Go notifier reads configuration from environment variables:
+
+```text
+APP_ENV               Runtime environment label. Default: dev.
+LOG_LEVEL             zerolog level. Default: info.
+RETRY_COUNT           Integer config value. Default: 3.
+SLACK_WEBHOOK_URL_PR  Slack webhook for event-type pr.
+SLACK_WEBHOOK_URL_CD  Slack webhook for event-type cd and job.
+```
+
+Logs are written to stderr. Payload output from `--dry-run` is written to stdout so it can be piped into `jq`.
+
+## Slack Notifier CLI
+
+Show flags:
 
 ```bash
-kubectl version
-kubectl get nodes
+go run ./cmd/slack-notifier --help
 ```
+
+### Normal Pipeline Notification
+
+Use this for PR/CD/job status messages built from CLI flags:
+
+```bash
+SLACK_WEBHOOK_URL_PR="https://hooks.slack.com/services/..." \
+go run ./cmd/slack-notifier \
+  --event-type pr \
+  --stage validation \
+  --status failed \
+  --pipeline-name pr-validation \
+  --failed-step go-test \
+  --error-message "unit tests failed"
+```
+
+Supported event routing:
+
+```text
+pr   -> SLACK_WEBHOOK_URL_PR
+cd   -> SLACK_WEBHOOK_URL_CD
+job  -> SLACK_WEBHOOK_URL_CD
+```
+
+### Tekton Failure Notification
+
+Collect failure data from a TaskRun and send a rich Slack message:
+
+```bash
+scripts/collect-failure.sh <taskrun-name> <namespace> \
+  | SLACK_WEBHOOK_URL_CD="https://hooks.slack.com/services/..." \
+    go run ./cmd/slack-notifier --failure-context-file -
+```
+
+`--failure-context-file` accepts a JSON file path. Use `-` to read JSON from stdin.
+
+Inline JSON is also supported:
+
+```bash
+go run ./cmd/slack-notifier \
+  --failure-context-json '{"namespace":"ci","task_run":"build-task","failed_step":"test","error_message":"tests failed","trace":"fatal: failed"}'
+```
+
+When failure context is supplied, missing event flags default to:
+
+```text
+--event-type job
+--stage tekton
+--status failed
+--pipeline-name <pipeline_run>, <task_run>, or tekton-task
+```
+
+### Dry Run
+
+Use `--dry-run` to validate inputs and print the exact Slack JSON payload without sending anything:
+
+```bash
+go run ./cmd/slack-notifier \
+  --dry-run \
+  --event-type pr \
+  --stage validation \
+  --status failed \
+  --pipeline-name pr-validation \
+  --failed-step go-test \
+  --error-message token=secret |
+  jq .
+```
+
+Dry-run is also useful for Tekton failure JSON:
+
+```bash
+go run ./cmd/slack-notifier \
+  --dry-run \
+  --failure-context-json '{"namespace":"ci","pipeline_run":"pr-run","task_run":"task-run","failed_step":"build","exit_code":"1","reason":"Failed","error_message":"password=secret","trace":"line1\nfatal: failed with token=abc"}' |
+  jq .
+```
+
+The notifier masks common secret patterns before building Slack payloads, including `password=...`, `token=...`, `secret=...`, `api_key=...`, bearer tokens, and PEM private keys.
+
+## Go Packages
+
+### `cmd/slack-notifier`
+
+The CLI entrypoint. It:
+
+- Parses flags.
+- Loads configuration.
+- Reads optional failure-context JSON.
+- Applies defaults for Tekton failure events.
+- Validates the pipeline event.
+- Builds a normal Slack attachment payload or rich failure block payload.
+- Sends the payload, or prints it in dry-run mode.
+
+### `internal/failure`
+
+Private failure-processing package. It:
+
+- Defines the `failure.Context` JSON shape used by `scripts/collect-failure.sh`.
+- Parses failure context JSON.
+- Masks common secret values.
+- Finds a likely error line from logs when no explicit error message exists.
+- Trims traces to a bounded line and byte count.
+
+### `internal/notify/slack`
+
+Private formatter for failure notifications. It creates Slack Block Kit payloads with:
+
+- TaskRun title.
+- Namespace, PipelineRun, failed step, exit code, reason, and error.
+- Short redacted trace.
+- Trimmed-trace marker when the trace was shortened.
+
+### `pkg/config`
+
+Loads environment variables into a typed config struct. Tests cover defaults, env overrides, and invalid integer handling.
+
+### `pkg/logger`
+
+Creates a zerolog logger with service and environment fields. Logs go to stderr.
+
+### `pkg/notify/model`
+
+Defines `PipelineEvent` and validates required event fields:
+
+- `EventType`
+- `Stage`
+- `Status`
+
+### `pkg/notify/router`
+
+Maps event types to Slack webhook URLs:
+
+- `pr` uses PR webhook.
+- `cd` uses CD webhook.
+- `job` falls back to CD webhook.
+- Unknown event types return an explicit route error.
+
+### `pkg/notify/slack`
+
+Reusable Slack client package. It:
+
+- Builds normal pipeline notification attachments.
+- Sends arbitrary Slack-compatible JSON payloads.
+- Uses an HTTP client timeout by default.
+- Preserves the existing `SendMessage` and `Send` APIs.
+
+### `pkg/status`
+
+Small pipeline status tracker used by tests and earlier notification flows. It records started/finished times and builds status summaries.
+
+## Scripts
+
+### `scripts/test-all.sh`
+
+Runs the local validation suite:
+
+```bash
+./scripts/test-all.sh
+```
+
+It checks:
+
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- Bash syntax for shell scripts
+- YAML syntax for `k8s/` and `.tekton/`
+- capture-error dependency check
+- capture-error success and failure smoke tests
+- slack-notifier normal dry-run payload
+- slack-notifier Tekton failure dry-run payload
+
+### `scripts/collect-failure.sh`
+
+Collects a Tekton TaskRun failure into JSON:
+
+```bash
+scripts/collect-failure.sh <taskrun-name> [namespace]
+```
+
+It reads the TaskRun, finds the backing pod, identifies the failed step, pulls recent step logs, applies basic shell-side redaction, and emits JSON compatible with `slack-notifier --failure-context-file`.
+
+This script requires:
+
+- kubectl
+- jq
+- access to the target namespace
+
+### `scripts/capture-error/`
+
+Generic command wrapper for structured error capture. See [scripts/capture-error/README.md](scripts/capture-error/README.md).
+
+Typical use:
+
+```bash
+./scripts/capture-error/capture-error.sh -- ./your-command --flag value
+```
+
+It captures stdout/stderr, detects error-like output, applies redaction, enforces time and output limits, and prints structured JSON.
+
+## Kubernetes Manifests
+
+### `k8s/namespace.yaml`
+
+Creates namespace:
+
+```text
+slack-integration-dev
+```
+
+### `k8s/serviceaccount.yaml`
+
+Creates service account:
+
+```text
+slack-notifier-sa
+```
+
+The Tekton EventListener uses this service account.
+
+### `k8s/eventlistener-rbac.yaml`
+
+Binds Tekton Triggers EventListener roles to `slack-notifier-sa`:
+
+- `tekton-triggers-eventlistener-roles`
+- `tekton-triggers-eventlistener-clusterroles`
+
+### `k8s/secret.yaml`
+
+Contains placeholder secrets:
+
+```text
+SLACK_WEBHOOK_URL_PR
+SLACK_WEBHOOK_URL_CD
+GIT_TOKEN
+```
+
+Replace placeholders before real Slack or Git usage. Do not commit real webhook URLs or tokens.
+
+## Tekton Manifests
+
+### `.tekton/pr-binding.yaml`
+
+Maps GitHub pull request JSON fields into Tekton trigger params:
+
+- repository clone URL
+- repository full name
+- PR number
+- commit SHA
+- source branch
+- target branch
+- sender
+- action
+
+### `.tekton/pr-trigger-template.yaml`
+
+Creates a `PipelineRun` for `pr-validation-pipeline` and passes the trigger params into the run.
+
+### `.tekton/pr-listener.yaml`
+
+Creates an EventListener named `pr-listener` that wires:
+
+- `pr-binding`
+- `pr-trigger-template`
+- `slack-notifier-sa`
+
+### `.tekton/pr-pipeline.yaml`
+
+Defines `pr-validation-pipeline`. The current task uses `alpine:3.19` and prints PR metadata. It does not call Slack by itself.
 
 ## Install Tekton
 
@@ -49,32 +382,12 @@ Install Tekton Pipelines:
 kubectl apply --filename https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
 ```
 
-Expected output includes CRDs such as:
-
-```text
-customresourcedefinition.apiextensions.k8s.io/pipelines.tekton.dev created
-customresourcedefinition.apiextensions.k8s.io/pipelineruns.tekton.dev created
-customresourcedefinition.apiextensions.k8s.io/tasks.tekton.dev created
-customresourcedefinition.apiextensions.k8s.io/taskruns.tekton.dev created
-deployment.apps/tekton-pipelines-controller created
-deployment.apps/tekton-pipelines-webhook created
-```
-
-Warnings like these are usually not fatal:
-
-```text
-Warning: unrecognized format "int64"
-Warning: unrecognized format "int32"
-```
-
-Verify Tekton Pipelines:
+Verify:
 
 ```bash
-kubectl get pods --namespace tekton-pipelines --watch
+kubectl get pods --namespace tekton-pipelines
 kubectl api-resources --api-group=tekton.dev
 ```
-
-Use the exact namespace `tekton-pipelines`. `tekton-pipeline` is wrong.
 
 Install Tekton Triggers:
 
@@ -83,46 +396,25 @@ kubectl apply --filename https://storage.googleapis.com/tekton-releases/triggers
 kubectl apply --filename https://storage.googleapis.com/tekton-releases/triggers/latest/interceptors.yaml
 ```
 
-Expected output includes:
-
-```text
-customresourcedefinition.apiextensions.k8s.io/eventlisteners.triggers.tekton.dev created
-customresourcedefinition.apiextensions.k8s.io/triggerbindings.triggers.tekton.dev created
-customresourcedefinition.apiextensions.k8s.io/triggertemplates.triggers.tekton.dev created
-deployment.apps/tekton-triggers-controller created
-deployment.apps/tekton-triggers-webhook created
-clusterinterceptor.triggers.tekton.dev/github created
-clusterinterceptor.triggers.tekton.dev/cel created
-```
-
-Verify Tekton Triggers:
+Verify:
 
 ```bash
-kubectl get pods --namespace tekton-pipelines --watch
+kubectl get pods --namespace tekton-pipelines
 kubectl api-resources --api-group=triggers.tekton.dev
 ```
 
 ## Apply This Project
 
-Apply the namespace and service account first:
+Apply base resources:
 
 ```bash
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/serviceaccount.yaml
-```
-
-Apply EventListener RBAC:
-
-```bash
 kubectl apply -f k8s/eventlistener-rbac.yaml
+kubectl apply -f k8s/secret.yaml
 ```
 
-This binds Tekton's built-in EventListener roles to `slack-notifier-sa`:
-
-- `tekton-triggers-eventlistener-roles`: namespace-scoped access to EventListener, TriggerBinding, TriggerTemplate, Trigger, Interceptor, ConfigMap, Event, and PipelineRun creation.
-- `tekton-triggers-eventlistener-clusterroles`: cluster-scoped access to ClusterTriggerBinding and ClusterInterceptor.
-
-Apply the Tekton PR flow:
+Apply Tekton resources:
 
 ```bash
 kubectl apply -f .tekton/pr-pipeline.yaml
@@ -131,7 +423,7 @@ kubectl apply -f .tekton/pr-trigger-template.yaml
 kubectl apply -f .tekton/pr-listener.yaml
 ```
 
-Verify resources:
+Verify:
 
 ```bash
 kubectl get pipeline -n slack-integration-dev
@@ -141,45 +433,18 @@ kubectl get eventlistener -n slack-integration-dev
 kubectl get all -n slack-integration-dev
 ```
 
-Healthy EventListener output:
+## Test The PR Webhook Flow
 
-```text
-NAME          ADDRESS                                                              AVAILABLE   REASON                     READY
-pr-listener   http://el-pr-listener.slack-integration-dev.svc.cluster.local:8080   True        MinimumReplicasAvailable   True
-```
-
-Healthy generated pod output:
-
-```text
-pod/el-pr-listener-...   1/1   Running   0
-deployment.apps/el-pr-listener   1/1   1   1
-```
-
-## Test The Webhook Flow
-
-Port-forward the EventListener service:
+Port-forward the EventListener:
 
 ```bash
 kubectl port-forward svc/el-pr-listener 8080:8080 -n slack-integration-dev
 ```
 
-Expected output:
-
-```text
-Forwarding from 127.0.0.1:8080 -> 8080
-Forwarding from [::1]:8080 -> 8080
-```
-
-If local port `8080` is already in use, use another local port:
+Send a test PR payload:
 
 ```bash
-kubectl port-forward svc/el-pr-listener 18080:8080 -n slack-integration-dev
-```
-
-Send a PR-style test payload:
-
-```bash
-curl -i -X POST http://127.0.0.1:18080/ \
+curl -i -X POST http://127.0.0.1:8080/ \
   -H 'Content-Type: application/json' \
   -H 'X-GitHub-Event: pull_request' \
   -d '{
@@ -204,61 +469,21 @@ curl -i -X POST http://127.0.0.1:18080/ \
   }'
 ```
 
-Postman should use:
-
-- Method: `POST`
-- URL: `http://127.0.0.1:8080/` or `http://127.0.0.1:18080/`
-- Header: `Content-Type: application/json`
-- Header: `X-GitHub-Event: pull_request`
-- Body: raw JSON using the same shape as above
-
-Successful EventListener response:
-
-```json
-{
-  "eventListener": "pr-listener",
-  "namespace": "slack-integration-dev",
-  "eventListenerUID": "8fc19209-c9db-4aaa-98f9-cdaac1059be4",
-  "eventID": "58ac45b1-c58c-47ee-bce3-2e3b4beda6f1"
-}
-```
-
-This response only means the EventListener accepted the request. Always verify the PipelineRun.
-
-## Verify Pipeline Execution
-
-Check PipelineRuns and TaskRuns:
+Successful EventListener response means the event was accepted. Always verify the generated PipelineRun:
 
 ```bash
 kubectl get pipelinerun -n slack-integration-dev --sort-by=.metadata.creationTimestamp
 kubectl get taskrun -n slack-integration-dev --sort-by=.metadata.creationTimestamp
 ```
 
-Successful output should include:
-
-```text
-NAME                      SUCCEEDED   REASON
-pr-validation-run-dcqrx   True        Succeeded
-
-NAME                                    SUCCEEDED   REASON
-pr-validation-run-dcqrx-print-pr-info   True        Succeeded
-```
-
-Inspect task logs:
+Inspect logs:
 
 ```bash
 kubectl get pods -n slack-integration-dev
-
 kubectl logs -n slack-integration-dev <taskrun-pod-name> --all-containers=true
 ```
 
-Example:
-
-```bash
-kubectl logs -n slack-integration-dev pr-validation-run-dcqrx-print-pr-info-pod --all-containers=true
-```
-
-Expected log output:
+Expected pipeline log content:
 
 ```text
 PR Event Received
@@ -271,43 +496,84 @@ Sender: rdh-tiwari
 Action: opened
 ```
 
-## Current End-To-End Test Result
+## Failure Collection Flow
 
-The current implemented flow was tested successfully:
+After a failed Tekton TaskRun:
 
-```text
-HTTP/1.1 202 Accepted
-eventID: 58ac45b1-c58c-47ee-bce3-2e3b4beda6f1
-
-PipelineRun: pr-validation-run-dcqrx
-PipelineRun status: True / Succeeded
-TaskRun: pr-validation-run-dcqrx-print-pr-info
-TaskRun status: True / Succeeded
+```bash
+scripts/collect-failure.sh <taskrun-name> slack-integration-dev > failure.json
 ```
 
-Task logs showed all mapped PR fields, including `source-branch`.
+Preview Slack payload:
 
-## Slack Notification Status
-
-If Postman returns success but Slack receives no message, check what the Pipeline actually does.
-
-Current `.tekton/pr-pipeline.yaml` only prints PR fields. It does not:
-
-- read `SLACK_WEBHOOK_URL_PR`
-- call Slack with `curl`
-- call the Go notifier service
-- run the `slack-notifier` application
-
-So no Slack message is expected from the current Tekton pipeline. To send Slack notifications, add a Slack notification step/task or call the deployed notifier service from the Pipeline.
-
-Also replace placeholder webhook values in `k8s/secret.yaml` before testing real Slack delivery:
-
-```yaml
-SLACK_WEBHOOK_URL_PR: "https://hooks.slack.com/services/REPLACE/PRME"
-SLACK_WEBHOOK_URL_CD: "https://hooks.slack.com/services/REPLACE/CDME"
+```bash
+go run ./cmd/slack-notifier --dry-run --failure-context-file failure.json | jq .
 ```
+
+Send to Slack:
+
+```bash
+SLACK_WEBHOOK_URL_CD="https://hooks.slack.com/services/..." \
+go run ./cmd/slack-notifier --failure-context-file failure.json
+```
+
+## Local Validation
+
+Run everything:
+
+```bash
+./scripts/test-all.sh
+```
+
+Individual checks:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+bash -n scripts/collect-failure.sh
+```
+
+YAML syntax check without cluster access:
+
+```bash
+ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_stream(File.read(f)); puts "ok #{f}" }' k8s/*.yaml .tekton/*.yaml
+```
+
+`kubectl apply --dry-run=client` may still contact a Kubernetes API server for discovery, depending on local kubectl configuration. Use the Ruby YAML check for offline syntax validation.
 
 ## Troubleshooting
+
+### No Slack Message After Postman Or curl
+
+The current Tekton pipeline only prints PR details. It does not call `slack-notifier`. Use the CLI directly, or add a Tekton task/step that invokes the notifier.
+
+### Missing Webhook Configuration
+
+Error:
+
+```text
+missing webhook configuration
+```
+
+Fix:
+
+```bash
+export SLACK_WEBHOOK_URL_PR="https://hooks.slack.com/services/..."
+export SLACK_WEBHOOK_URL_CD="https://hooks.slack.com/services/..."
+```
+
+Use `SLACK_WEBHOOK_URL_CD` for `job` failure notifications.
+
+### Unknown Event Type
+
+Valid event types are:
+
+```text
+pr
+cd
+job
+```
 
 ### Pipeline Kind Not Recognized
 
@@ -315,215 +581,58 @@ Error:
 
 ```text
 no matches for kind "Pipeline" in version "tekton.dev/v1"
-ensure CRDs are installed first
 ```
 
-Cause: Tekton Pipelines CRDs are missing or incompatible.
-
-Check:
-
-```bash
-kubectl api-resources --api-group=tekton.dev
-```
-
-Fix: install Tekton Pipelines.
+Install or fix Tekton Pipelines CRDs.
 
 ### EventListener Kind Not Recognized
 
-Error:
+Check the API group. This repo uses:
 
 ```text
-no matches for kind "EventListener" in version "trigger.tekton.dev/v1beta1"
+triggers.tekton.dev/v1beta1
 ```
 
-Cause: wrong API group. It must be `triggers.tekton.dev`, not `trigger.tekton.dev`.
+Install Tekton Triggers if the resource is missing.
 
-Correct:
+### collect-failure Cannot Find Pod
 
-```yaml
-apiVersion: triggers.tekton.dev/v1beta1
-kind: EventListener
-```
-
-### EventListener Template Decode Error
-
-Error:
-
-```text
-json: cannot unmarshal array into Go struct field EventListenerTrigger.spec.triggers.template
-```
-
-Cause: `template` was written as a list.
-
-Wrong:
-
-```yaml
-template:
-  - ref: pr-trigger-template
-```
-
-Correct:
-
-```yaml
-template:
-  ref: pr-trigger-template
-```
-
-### Port-Forward Connection Refused
-
-Error:
-
-```text
-socat ... connect(5, AF=2 127.0.0.1:8080, 16): Connection refused
-error: lost connection to pod
-```
-
-Cause: the EventListener pod is not listening on port `8080`, usually because it is unhealthy or crashing.
-
-Check:
+Confirm the TaskRun exists and has started:
 
 ```bash
-kubectl get all -n slack-integration-dev
-kubectl describe pod -n slack-integration-dev <el-pr-listener-pod-name>
-kubectl logs -n slack-integration-dev <el-pr-listener-pod-name> --previous
-kubectl get events -n slack-integration-dev --sort-by=.lastTimestamp
+kubectl get taskrun -n <namespace>
+kubectl describe taskrun <taskrun-name> -n <namespace>
 ```
 
-If logs show RBAC errors like this:
+### Dry Run Output Is Not JSON
 
-```text
-User "system:serviceaccount:slack-integration-dev:slack-notifier-sa" cannot list resource "triggerbindings"
-failed to start informers:failed to wait for cache at index 0 to sync
-```
+Application logs should go to stderr and payload JSON should go to stdout. If a wrapper combines stderr and stdout, pipe stdout only into `jq`.
 
-Fix:
+## Security Notes
 
-```bash
-kubectl apply -f k8s/serviceaccount.yaml
-kubectl apply -f k8s/eventlistener-rbac.yaml
-kubectl apply -f .tekton/pr-listener.yaml
-kubectl rollout restart deployment/el-pr-listener -n slack-integration-dev
-kubectl rollout status deployment/el-pr-listener -n slack-integration-dev
-```
+- Do not commit real Slack webhook URLs.
+- Do not commit real Git tokens.
+- `scripts/collect-failure.sh` and `internal/failure` perform best-effort redaction, not compliance-grade data loss prevention.
+- Keep traces bounded before posting to Slack.
+- Prefer Kubernetes Secrets or CI secret stores for webhook injection.
 
-### ServiceAccount Not Found
+## Current Production Readiness
 
-Error in EventListener status:
+Implemented:
 
-```text
-serviceaccount "slack-notifier-sa" not found
-```
+- Typed config loading.
+- Event validation.
+- Webhook routing.
+- HTTP timeout for Slack sends.
+- Rich failure payload formatting.
+- Secret masking for common patterns.
+- Trace trimming.
+- Dry-run payload preview.
+- Go unit tests, race tests, vet, script syntax checks, YAML syntax checks, and smoke tests through `scripts/test-all.sh`.
 
-Cause: `.tekton/pr-listener.yaml` references `slack-notifier-sa`, but `k8s/serviceaccount.yaml` was not applied.
+Still needed for a fully automated cluster deployment:
 
-Fix:
-
-```bash
-kubectl apply -f k8s/serviceaccount.yaml
-```
-
-### PipelineRun ParameterMissing
-
-Error:
-
-```text
-pipelineRun missing parameters: [source-branch]
-```
-
-Cause: the Pipeline requires a param that the TriggerTemplate did not pass into the generated PipelineRun.
-
-Check:
-
-```bash
-kubectl describe pipelinerun <pipelinerun-name> -n slack-integration-dev
-```
-
-Fix: make sure `.tekton/pr-trigger-template.yaml` passes every required Pipeline param, including:
-
-```yaml
-- name: source-branch
-  value: $(tt.params.source-branch)
-```
-
-### Empty Or Invalid Request Body
-
-Error:
-
-```text
-Invalid event body format : unexpected end of JSON input
-```
-
-Cause: EventListener received an empty or invalid JSON body.
-
-Fix: send valid JSON with `Content-Type: application/json`.
-
-## Useful Commands
-
-```bash
-kubectl get all -n slack-integration-dev
-kubectl get eventlistener -n slack-integration-dev
-kubectl get pipeline -n slack-integration-dev
-kubectl get pipelinerun -n slack-integration-dev
-kubectl get taskrun -n slack-integration-dev
-kubectl get events -n slack-integration-dev --sort-by=.lastTimestamp
-```
-
-Describe resources:
-
-```bash
-kubectl describe eventlistener pr-listener -n slack-integration-dev
-kubectl describe deployment el-pr-listener -n slack-integration-dev
-kubectl describe pipelinerun <pipelinerun-name> -n slack-integration-dev
-kubectl describe taskrun <taskrun-name> -n slack-integration-dev
-```
-
-Logs:
-
-```bash
-kubectl logs -n slack-integration-dev <pod-name>
-kubectl logs -n slack-integration-dev <pod-name> --previous
-kubectl logs -n slack-integration-dev <taskrun-pod-name> --all-containers=true
-```
-
-## App Deployment
-
-The current `k8s/deployment.yaml` is configured for cluster wiring tests, not the real app image:
-
-- Image: `busybox:1.36`
-- Command: `sh -c "env && sleep 3600"`
-- Service account: `slack-notifier-sa`
-
-Apply app support manifests:
-
-```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
-kubectl apply -f k8s/deployment.yaml
-```
-
-Inspect:
-
-```bash
-kubectl rollout status deployment/slack-notifier -n slack-integration-dev
-kubectl logs -n slack-integration-dev deploy/slack-notifier
-```
-
-## Cleanup
-
-Delete app support resources:
-
-```bash
-kubectl delete -f k8s/deployment.yaml
-kubectl delete -f k8s/configmap.yaml
-kubectl delete -f k8s/secret.yaml
-```
-
-Delete Tekton project resources:
-
-```bash
-kubectl delete -f .tekton/pr-listener.yaml
-kubectl delete -f .tekton/pr-trigger-template.yaml
-kubectl delete -f .tekton/pr-binding.yaml
-kubectl delete -f .tekton/pr-pipeline.yaml
-kubectl delete -f k8s/eventlistener-rbac.yaml
-```
+- Container image build/publish for `slack-notifier`.
+- Tekton task/step that invokes the notifier.
+- Deployment or CronJob manifests if this should run as a service.
+- CI workflow to run `scripts/test-all.sh`.

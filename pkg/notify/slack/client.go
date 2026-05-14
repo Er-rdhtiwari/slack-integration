@@ -25,6 +25,10 @@ func NewClient(httpClient ...*http.Client) Client {
 }
 
 func (c Client) SendMessage(webhookURL string, message Message) error {
+	return c.SendPayload(webhookURL, message)
+}
+
+func (c Client) SendPayload(webhookURL string, payload any) error {
 	if webhookURL == "" {
 		return ErrEmptyWebhookURL
 	}
@@ -32,9 +36,9 @@ func (c Client) SendMessage(webhookURL string, message Message) error {
 		return ErrNilHTTPClient
 	}
 
-	body, err := json.Marshal(message)
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal slack message: %w", err)
+		return fmt.Errorf("marshal slack payload: %w", err)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewBuffer(body))

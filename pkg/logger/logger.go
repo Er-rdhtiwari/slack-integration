@@ -23,7 +23,7 @@ func New(env string, logLevel ...string) zerolog.Logger {
 	}
 
 	zerolog.SetGlobalLevel(level)
-	return zerolog.New(os.Stdout).
+	return zerolog.New(os.Stderr).
 		With().
 		Timestamp().
 		Str("service", "slack-notifier").

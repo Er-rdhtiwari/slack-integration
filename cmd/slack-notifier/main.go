@@ -1,15 +1,21 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
+	"strings"
 
+	"github.com/Er-rdhtiwari/slack-integration/internal/failure"
+	failureslack "github.com/Er-rdhtiwari/slack-integration/internal/notify/slack"
 	"github.com/Er-rdhtiwari/slack-integration/pkg/config"
 	applogger "github.com/Er-rdhtiwari/slack-integration/pkg/logger"
-	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/model"
+	notifymodel "github.com/Er-rdhtiwari/slack-integration/pkg/notify/model"
 	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/router"
-	"github.com/Er-rdhtiwari/slack-integration/pkg/notify/slack"
+	notifyslack "github.com/Er-rdhtiwari/slack-integration/pkg/notify/slack"
 	pipelinestatus "github.com/Er-rdhtiwari/slack-integration/pkg/status"
 )
 
@@ -21,10 +27,13 @@ func main() {
 	failedStep := flag.String("failed-step", "", "failed step")
 	errorMessage := flag.String("error-message", "", "error message")
 	env := flag.String("env", "", "environment")
+	failureContextFile := flag.String("failure-context-file", "", "path to Tekton failure context JSON, or - for stdin")
+	failureContextJSON := flag.String("failure-context-json", "", "Tekton failure context JSON string")
+	dryRun := flag.Bool("dry-run", false, "print the Slack payload without sending it")
 
 	flag.Parse()
 
-	cfg, err := config.Load()
+	cfg, configErr := config.Load()
 	logEnv := "dev"
 	logLevel := ""
 	if cfg != nil {
@@ -37,7 +46,21 @@ func main() {
 
 	log := applogger.New(logEnv, logLevel)
 
-	event := model.PipelineEvent{
+	failureContext, hasFailureContext, err := loadFailureContext(*failureContextFile, *failureContextJSON)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Msg("failure context loading failed")
+
+		os.Exit(1)
+	}
+
+	if hasFailureContext {
+		applyFailureDefaults(failureContext, eventType, stage, status, pipelineName, failedStep, errorMessage)
+	}
+	*errorMessage = failure.MaskSecrets(strings.TrimSpace(*errorMessage))
+
+	event := notifymodel.PipelineEvent{
 		EventType:    *eventType,
 		Stage:        *stage,
 		Status:       *status,
@@ -45,22 +68,17 @@ func main() {
 		FailedStep:   *failedStep,
 		ErrorMessage: *errorMessage,
 	}
-
-	tracker := pipelinestatus.NewPipelineTracker(*pipelineName, *eventType, *stage)
-	switch *status {
-	case string(pipelinestatus.StatusSucceeded):
-		tracker.MarkSucceeded()
-	case string(pipelinestatus.StatusFailed):
-		tracker.MarkFailed(*failedStep, *errorMessage)
+	if hasFailureContext {
+		event.PipelineRunName = failureContext.PipelineRun
 	}
 
 	eventLogger := applogger.WithEvent(log, event).Logger()
 
 	eventLogger.Info().Msg("notification processing started")
 
-	if err != nil {
+	if configErr != nil {
 		eventLogger.Error().
-			Err(err).
+			Err(configErr).
 			Msg("configuration loading failed")
 
 		os.Exit(1)
@@ -72,6 +90,26 @@ func main() {
 			Msg("pipeline event validation failed")
 
 		os.Exit(1)
+	}
+
+	var payload any
+	if hasFailureContext {
+		payload = failureslack.FormatFailureMessage(failureContext)
+	} else {
+		payload = notifyslack.BuildMessage(event)
+	}
+
+	if *dryRun {
+		if err := writeDryRunPayload(os.Stdout, payload); err != nil {
+			eventLogger.Error().
+				Err(err).
+				Msg("failed to write dry-run payload")
+
+			os.Exit(1)
+		}
+
+		eventLogger.Info().Msg("dry run completed")
+		return
 	}
 
 	rt := router.NewRouter(router.Config{
@@ -94,13 +132,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := slack.NewClient()
+	client := notifyslack.NewClient()
 
-	message := slack.Message{
-		Text: tracker.Summary(),
-	}
-
-	if err := client.SendMessage(webhookURL, message); err != nil {
+	if err := client.SendPayload(webhookURL, payload); err != nil {
 		eventLogger.Error().
 			Err(err).
 			Msg("failed to send slack notification")
@@ -109,4 +143,77 @@ func main() {
 	}
 
 	eventLogger.Info().Msg("slack notification sent successfully")
+}
+
+func writeDryRunPayload(w io.Writer, payload any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(payload)
+}
+
+func loadFailureContext(filePath, rawJSON string) (failure.Context, bool, error) {
+	if strings.TrimSpace(filePath) == "" && strings.TrimSpace(rawJSON) == "" {
+		return failure.Context{}, false, nil
+	}
+	if strings.TrimSpace(filePath) != "" && strings.TrimSpace(rawJSON) != "" {
+		return failure.Context{}, false, fmt.Errorf("use only one of --failure-context-file or --failure-context-json")
+	}
+
+	var raw []byte
+	var err error
+	if strings.TrimSpace(rawJSON) != "" {
+		raw = []byte(rawJSON)
+	} else if filePath == "-" {
+		raw, err = io.ReadAll(os.Stdin)
+	} else {
+		raw, err = os.ReadFile(filePath)
+	}
+	if err != nil {
+		return failure.Context{}, false, fmt.Errorf("read failure context: %w", err)
+	}
+
+	ctx, err := failure.ParseContext(raw)
+	if err != nil {
+		return failure.Context{}, false, err
+	}
+
+	return ctx, true, nil
+}
+
+func applyFailureDefaults(
+	ctx failure.Context,
+	eventType *string,
+	stage *string,
+	status *string,
+	pipelineName *string,
+	failedStep *string,
+	errorMessage *string,
+) {
+	if strings.TrimSpace(*eventType) == "" {
+		*eventType = "job"
+	}
+	if strings.TrimSpace(*stage) == "" {
+		*stage = "tekton"
+	}
+	if strings.TrimSpace(*status) == "" {
+		*status = string(pipelinestatus.StatusFailed)
+	}
+	if strings.TrimSpace(*pipelineName) == "" {
+		*pipelineName = firstNonEmpty(ctx.PipelineRun, ctx.TaskRun, "tekton-task")
+	}
+	if strings.TrimSpace(*failedStep) == "" {
+		*failedStep = ctx.FailedStep
+	}
+	if strings.TrimSpace(*errorMessage) == "" {
+		*errorMessage = ctx.ErrorMessage
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
